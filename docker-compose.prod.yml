@@ -44,16 +44,18 @@ services:
 
   frontend:
     restart: always
-    # `!reset` is required here too. The base file publishes
-    # "${FRONTEND_PORT:-3000}:80", and because compose merges port LISTS, a
-    # plain override would leave BOTH mappings in place — the same host port
-    # bound twice, which fails with "address already in use". Reset first, then
-    # declare the single mapping we actually want.
+    # `!override` (NOT `!reset`) is required here. Compose merges port LISTS
+    # across files by appending, so a plain override leaves both the base
+    # "${FRONTEND_PORT:-3000}:80" and this mapping in place -> the same host
+    # port bound twice -> "address already in use", frontend never starts.
+    # `!reset` is the wrong tool: it clears the value entirely, so the
+    # container ends up publishing nothing at all (shows bare "80/tcp").
+    # `!override` replaces the list with exactly what is written here.
     #
     # Default bind is loopback: safe behind a tunnel or same-host reverse proxy,
     # and exposes nothing if neither is present. Set FRONTEND_BIND=0.0.0.0 only
     # when something is deliberately in front of it.
-    ports: !reset
+    ports: !override
       - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8080}:80"
     logging:
       driver: json-file
