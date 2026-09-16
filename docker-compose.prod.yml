@@ -1,0 +1,53 @@
+version: '3.9'
+
+# Production overrides. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Differences from the dev compose file:
+#   - Database is NEVER exposed on a host port (dev already does this; kept explicit)
+#   - Backend is NEVER exposed on a host port — only the frontend nginx reaches it,
+#     over the internal docker network. This is the whole point: one public surface.
+#   - Frontend binds to 127.0.0.1 by default, not 0.0.0.0, so nothing is reachable
+#     from the internet unless a tunnel or reverse proxy is deliberately put in front.
+#     Set FRONTEND_BIND=0.0.0.0 only if you are terminating TLS on this host.
+#   - Container logs are capped so a long-running box cannot fill its disk.
+
+services:
+
+  db:
+    restart: always
+    ports: []                       # never publish the database
+    environment:
+      POSTGRES_DB:       toolsagent
+      POSTGRES_USER:     toolsagent
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    command:
+      - postgres
+      - -c
+      - max_connections=50          # modest box; default 100 is more than we need
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    restart: always
+    ports: []                       # reachable only via the frontend proxy
+    environment:
+      NODE_ENV: production
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    restart: always
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8080}:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

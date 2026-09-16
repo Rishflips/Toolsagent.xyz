@@ -36,3 +36,11 @@ coverage/
 
 # Docker volumes
 db_data/
+
+# Local planning workspace (Hermes / agent plans) — not part of the project
+.hermes/
+
+# Database backups — contain real user data and secrets. Never commit these.
+backups/
+*.env.backup
+.env.from-backup
