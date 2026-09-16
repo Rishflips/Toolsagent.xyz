@@ -44,10 +44,16 @@ services:
 
   frontend:
     restart: always
-    # Default to loopback: works out of the box with a tunnel or a reverse
-    # proxy on the same host, and exposes nothing if neither is configured.
-    # Set FRONTEND_BIND=0.0.0.0 only when something is deliberately in front.
-    ports:
+    # `!reset` is required here too. The base file publishes
+    # "${FRONTEND_PORT:-3000}:80", and because compose merges port LISTS, a
+    # plain override would leave BOTH mappings in place — the same host port
+    # bound twice, which fails with "address already in use". Reset first, then
+    # declare the single mapping we actually want.
+    #
+    # Default bind is loopback: safe behind a tunnel or same-host reverse proxy,
+    # and exposes nothing if neither is present. Set FRONTEND_BIND=0.0.0.0 only
+    # when something is deliberately in front of it.
+    ports: !reset
       - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8080}:80"
     logging:
       driver: json-file
