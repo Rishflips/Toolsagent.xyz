@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 
 const BASE = '/api'
 
-function getToken() {
+export function getToken() {
   return sessionStorage.getItem('ts_token') || localStorage.getItem('ts_token') || ''
 }
 
@@ -29,7 +29,16 @@ export async function apiFetch(path, options = {}) {
 
   if (res.status === 401) {
     clearToken()
-    window.location.href = '/login'
+    // Do NOT hard-navigate when we are already on an auth page. The original
+    // code redirected unconditionally, which closed an infinite reload loop:
+    //   load /login -> AuthProvider probes /auth/me -> no token -> 401 ->
+    //   redirect to /login (full page reload) -> repeat forever.
+    // Measured at ~3 page loads per second, so the form was unusable.
+    // Only a genuine session expiry (401 while on an app page) should bounce.
+    const p = window.location.pathname
+    if (p !== '/login' && p !== '/signup') {
+      window.location.replace('/login')
+    }
     return null
   }
 
