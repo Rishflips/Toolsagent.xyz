@@ -1,0 +1,40 @@
+{
+  "name": "@toolsagent/sdk",
+  "version": "1.0.0",
+  "description": "Unified SDK for ToolsAgent \u2014 Observe \u00b7 Spend \u00b7 Deploy your AI agents",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "llm",
+    "observability",
+    "spend",
+    "deploy",
+    "openai",
+    "anthropic",
+    "toolsagent",
+    "monitoring"
+  ],
+  "author": "Rishflips",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rishflips/Toolsagent.xyz"
+  },
+  "homepage": "https://toolsagent.xyz",
+  "bugs": {
+    "url": "https://github.com/Rishflips/Toolsagent.xyz/issues"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}

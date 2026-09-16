@@ -1,0 +1,78 @@
+version: '3.9'
+
+services:
+
+  # ── DATABASE ───────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: toolsagent-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       toolsagent
+      POSTGRES_USER:     toolsagent
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-toolsagent_dev}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toolsagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - toolsagent
+
+  # ── BACKEND ───────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: toolsagent-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV:          ${NODE_ENV:-production}
+      PORT:              4000
+      DATABASE_URL:      postgresql://toolsagent:${DB_PASSWORD:-toolsagent_dev}@db:5432/toolsagent
+      # No insecure defaults. See .env.example for how to generate these.
+      # Compose refuses to start until both are set in .env.
+      JWT_SECRET:        ${JWT_SECRET:?JWT_SECRET is required - see .env.example}
+      ENCRYPTION_SECRET: ${ENCRYPTION_SECRET:?ENCRYPTION_SECRET is required - see .env.example}
+      FRONTEND_URL:      ${FRONTEND_URL:-http://localhost:3000}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+    ports:
+      - "${BACKEND_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - toolsagent
+
+  # ── FRONTEND ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: toolsagent-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:4000}
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - toolsagent
+
+volumes:
+  db_data:
+
+networks:
+  toolsagent:
+    driver: bridge
