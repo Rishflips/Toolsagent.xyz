@@ -3,20 +3,20 @@ version: '3.9'
 # Production overrides. Use with:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
-# Differences from the dev compose file:
-#   - Database is NEVER exposed on a host port (dev already does this; kept explicit)
-#   - Backend is NEVER exposed on a host port — only the frontend nginx reaches it,
-#     over the internal docker network. This is the whole point: one public surface.
-#   - Frontend binds to 127.0.0.1 by default, not 0.0.0.0, so nothing is reachable
-#     from the internet unless a tunnel or reverse proxy is deliberately put in front.
-#     Set FRONTEND_BIND=0.0.0.0 only if you are terminating TLS on this host.
-#   - Container logs are capped so a long-running box cannot fill its disk.
+# The goal is a single public surface. Nothing but the frontend should ever be
+# reachable from outside the host.
+#
+# Note on `!reset`: docker compose MERGES the ports lists from the base file and
+# this one — it appends rather than replaces. So writing `ports: []` here does
+# NOT remove the base mapping; the backend kept binding 0.0.0.0:4000. `!reset`
+# is the Compose directive that genuinely clears the inherited value. Requires
+# Compose 2.24+ (this deployment runs 2.40.3).
 
 services:
 
   db:
     restart: always
-    ports: []                       # never publish the database
+    ports: !reset []                  # never publish the database
     environment:
       POSTGRES_DB:       toolsagent
       POSTGRES_USER:     toolsagent
@@ -24,7 +24,7 @@ services:
     command:
       - postgres
       - -c
-      - max_connections=50          # modest box; default 100 is more than we need
+      - max_connections=50            # modest box; the default 100 is wasteful
     logging:
       driver: json-file
       options:
@@ -33,7 +33,7 @@ services:
 
   backend:
     restart: always
-    ports: []                       # reachable only via the frontend proxy
+    ports: !reset []                  # reachable ONLY via the frontend proxy
     environment:
       NODE_ENV: production
     logging:
@@ -44,6 +44,9 @@ services:
 
   frontend:
     restart: always
+    # Default to loopback: works out of the box with a tunnel or a reverse
+    # proxy on the same host, and exposes nothing if neither is configured.
+    # Set FRONTEND_BIND=0.0.0.0 only when something is deliberately in front.
     ports:
       - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8080}:80"
     logging:
