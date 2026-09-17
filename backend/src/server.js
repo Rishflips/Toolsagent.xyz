@@ -491,7 +491,9 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
 
     ok(res, {
       spend: {
-        total_30d:   mtdSpend.toFixed(2),
+        // formatCost preserves sub-cent precision: an account whose whole
+        // spend is $0.003 must not read as "$0.00" (i.e. free).
+        total_30d:   formatCost(mtdSpend),
         total_calls: totR.rows[0]?.calls || '0',
         total_tokens:totR.rows[0]?.tokens || '0',
         avg_tokens_per_day: Math.round((parseInt(totR.rows[0]?.tokens)||0) / 30),
@@ -508,15 +510,15 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
         items: wasteItems,
       },
       projection: {
-        mtd_spend:       mtdSpend.toFixed(2),
-        daily_burn:      dailyBurn.toFixed(2),
-        projected_total: projected.toFixed(2),
+        mtd_spend:       formatCost(mtdSpend),
+        daily_burn:      formatCost(dailyBurn),
+        projected_total: formatCost(projected),
         days_elapsed:    new Date().getDate(),
         days_remaining:  daysLeft,
         days_in_month:   30,
         budget:          100,
         over_budget:     projected > 100,
-        over_by:         Math.max(0, projected - 100).toFixed(2),
+        over_by:         formatCost(Math.max(0, projected - 100)),
       },
       daily_spend,
       output_cost,

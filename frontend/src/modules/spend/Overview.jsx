@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { StatCard, Panel, Button, EmptyState } from '../../components/ui/index'
-import { clsx } from 'clsx'
+import { useData } from '../../hooks/useApi'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid
@@ -11,57 +11,65 @@ function ChartTip({ active, payload, label }) {
   return (
     <div style={{ background: 'var(--base2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 12px', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
       <div style={{ color: 'var(--text3)', marginBottom: 4 }}>{label}</div>
-      {payload.map(p => (
-        <div key={p.name} style={{ color: p.color, display: 'flex', gap: 12, justifyContent: 'space-between' }}>
-          <span>{p.name}</span><span style={{ fontWeight: 600 }}>{typeof p.value === 'number' && p.value < 10 ? `$${p.value.toFixed(2)}` : p.value}</span>
-        </div>
-      ))}
+      {payload.map(p => {
+        const v = Number(p.value)
+        return (
+          <div key={p.name} style={{ color: p.color, display: 'flex', gap: 12, justifyContent: 'space-between' }}>
+            <span>{p.name}</span>
+            <span style={{ fontWeight: 600 }}>
+              {Number.isFinite(v) ? (v < 10 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`) : '—'}
+            </span>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-const DAILY = [
-  { d:'M1',  openai:28, anthropic:12, google:8,  cohere:0  },
-  { d:'M4',  openai:31, anthropic:14, google:9,  cohere:0  },
-  { d:'M7',  openai:29, anthropic:13, google:8,  cohere:0  },
-  { d:'M10', openai:34, anthropic:18, google:10, cohere:0  },
-  { d:'M13', openai:38, anthropic:22, google:11, cohere:4  },
-  { d:'M16', openai:36, anthropic:31, google:10, cohere:8  },
-  { d:'M19', openai:41, anthropic:48, google:12, cohere:11 },
-  { d:'M22', openai:44, anthropic:72, google:13, cohere:9  },
-  { d:'M25', openai:39, anthropic:61, google:11, cohere:10 },
-  { d:'M28', openai:42, anthropic:58, google:12, cohere:12 },
-]
+// A real presentational lookup keyed on provider name. Colours are ours; the
+// keys come from data.
+const PROV_COLORS = { anthropic: '#c9a96e', openai: '#10a37f', google: '#4285f4', cohere: '#9b59b6' }
+const PROV_FALLBACK = ['#4D9EFF', '#FF8C42', '#B47AFF', '#00F5A0']
+const FEATURE_COLORS = ['var(--red)', 'var(--acid)', 'var(--green)', 'var(--purple)', 'var(--blue)', 'var(--orange)']
 
-const OUTPUT_COST = [
-  { d:'M1',  drafter:0.011, checkout:0.008, support:0.004 },
-  { d:'M4',  drafter:0.012, checkout:0.008, support:0.003 },
-  { d:'M7',  drafter:0.012, checkout:0.007, support:0.004 },
-  { d:'M10', drafter:0.015, checkout:0.008, support:0.003 },
-  { d:'M13', drafter:0.019, checkout:0.008, support:0.004 },
-  { d:'M16', drafter:0.026, checkout:0.007, support:0.003 },
-  { d:'M19', drafter:0.031, checkout:0.008, support:0.004 },
-  { d:'M22', drafter:0.031, checkout:0.008, support:0.003 },
-  { d:'M25', drafter:0.030, checkout:0.007, support:0.004 },
-  { d:'M28', drafter:0.031, checkout:0.008, support:0.003 },
-]
+// Mirrors the API's formatCost: never round a real sub-cent cost down to
+// "$0.00", which would read as free.
+const money = (v) => {
+  const n = Number(v) || 0
+  if (n === 0) return '$0.00'
+  if (Math.abs(n) < 0.01) return `$${n.toFixed(4)}`
+  return `$${n.toFixed(2)}`
+}
 
-const MODELS = [
-  { model:'claude-3-5-sonnet-20241022', provider:'anthropic', features:['email-drafter','research'], tokens:'18.4M', cost:'891.00', spike:true,  waste:false },
-  { model:'gpt-4o',                     provider:'openai',    features:['checkout-flow'],            tokens:'12.1M', cost:'612.00', spike:false, waste:false },
-  { model:'gpt-4o-mini',                provider:'openai',    features:['classify','triage'],        tokens:'41.2M', cost:'298.00', spike:false, waste:false },
-  { model:'gemini-1.5-pro',             provider:'google',    features:['doc-summariser'],           tokens:'9.8M',  cost:'241.00', spike:false, waste:false },
-  { model:'gpt-4-turbo',                provider:'openai',    features:['legacy-pipeline'],          tokens:'5.2M',  cost:'188.00', spike:false, waste:true  },
-  { model:'command-r-plus',             provider:'cohere',    features:['rag-pipeline'],             tokens:'3.1M',  cost:'121.00', spike:false, waste:false, new:true },
-]
+function fmtTokens(n) {
+  const v = Number(n) || 0
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return String(v)
+}
 
-const WASTE = [
-  { src:'email-drafter · claude-3-5-sonnet', saving:310, desc:'Oversized system prompts avg 8,241 tokens. Full policy doc on every call. Move to RAG lookup.', pct:91 },
-  { src:'legacy-pipeline · gpt-4-turbo',     saving:141, desc:'18% retry rate from context_length_exceeded. Inputs not truncated before submission.',          pct:41 },
-  { src:'support-bot · gpt-4o',              saving:62,  desc:'Duplicate intent classification same ticket ID within 30s. Missing response cache layer.',       pct:18 },
-]
+// Recharts treats a string dataKey as a dotted path, so a provider or feature
+// name containing a dot would be read as a nested lookup and never match. Map
+// every real name to a safe positional key and keep the display name beside it.
+function seriesFrom(rows, colors, colorMap) {
+  const names = [...new Set(rows.flatMap(r => Object.keys(r).filter(k => k !== 'd')))].sort()
+  return names.map((name, i) => ({
+    key: `k${i}`,
+    name,
+    color: (colorMap && colorMap[name]) || colors[i % colors.length],
+  }))
+}
 
-const PROV_COLORS = { anthropic:'#c9a96e', openai:'#10a37f', google:'#4285f4', cohere:'#9b59b6' }
+function toRows(rows, series) {
+  return rows.map(r => {
+    const out = { d: r.d }
+    for (const s of series) {
+      if (r[s.name] !== undefined && r[s.name] !== null) out[s.key] = Number(r[s.name])
+    }
+    return out
+  })
+}
 
 // Connect Key Modal
 function ConnectKeyModal({ onClose }) {
@@ -122,27 +130,74 @@ function ConnectKeyModal({ onClose }) {
 
 export default function SpendOverview() {
   const [showConnect, setShowConnect] = useState(false)
+  const { data, loading, error, refetch } = useData('/v1/spend/dashboard?range=30d')
+
+  if (loading) {
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text3)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+      Loading spend data…
+    </div>
+  }
+  if (error) {
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--red)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+      Could not load spend data: {error}
+      <div style={{ marginTop: 12 }}>
+        <Button variant="ghost" size="sm" onClick={refetch}>Retry</Button>
+      </div>
+    </div>
+  }
+
+  const dash     = data || {}
+  const spend    = dash.spend      || {}
+  const waste    = dash.waste      || {}
+  const proj     = dash.projection || {}
+  const models   = dash.by_model   || []
+  const daily    = dash.daily_spend || []
+  const output   = dash.output_cost || []
+  const features = dash.by_feature  || []
+  const providers = dash.providers  || []
+  const alerts   = dash.active_alerts || []
+  const wasteItems = waste.items || []
+
+  const totalTokens = Number(spend.total_tokens) || 0
+  const totalSpend  = Number(spend.total_30d) || 0
+
+  // Chart series come from the keys actually present in the data.
+  const provSeries = seriesFrom(daily, PROV_FALLBACK, PROV_COLORS)
+  const provRows   = toRows(daily, provSeries)
+  const featSeries = seriesFrom(output, FEATURE_COLORS)
+  const featRows   = toRows(output, featSeries)
+
+  const featureTotal = features.reduce((s, f) => s + Number(f.cost || 0), 0)
+  const costPer1k    = totalTokens > 0 ? (totalSpend / totalTokens) * 1000 : null
+  const retryCost    = Number(waste.total_waste_cost || 0)
+  const overBudget   = !!proj.over_budget
 
   return (
     <div style={{ padding: 24 }}>
 
-      {/* Spike Alert */}
-      <div style={{ background:'var(--red-dim)',border:'1px solid rgba(255,77,109,0.3)',borderRadius:10,padding:'12px 16px',display:'flex',alignItems:'center',gap:12,marginBottom:20,animation:'fadeUp 0.4s ease' }}>
-        <span style={{ fontSize:16 }}>⚡</span>
-        <div style={{ flex:1 }}>
-          <div style={{ fontFamily:'var(--font-display)',fontWeight:700,fontSize:13,color:'var(--red)' }}>SPIKE: Anthropic claude-3-5-sonnet up 340% in 2h</div>
-          <div style={{ fontSize:11,color:'var(--text2)',marginTop:2,fontFamily:'var(--font-mono)' }}>email-drafter sending 8,241-token prompts · $148 today · projected $1,340/mo if unfixed</div>
+      {/* Spike / budget alerts — shown only when the API reports real ones. */}
+      {alerts.length > 0 && (
+        <div style={{ background:'var(--red-dim)',border:'1px solid rgba(255,77,109,0.3)',borderRadius:10,padding:'12px 16px',display:'flex',alignItems:'flex-start',gap:12,marginBottom:20,animation:'fadeUp 0.4s ease' }}>
+          <span style={{ fontSize:16 }}>⚡</span>
+          <div style={{ flex:1 }}>
+            {alerts.slice(0, 3).map((a, i) => (
+              <div key={i} style={{ fontFamily:'var(--font-display)',fontWeight:700,fontSize:13,color: a.level === 'error' ? 'var(--red)' : 'var(--acid)', marginBottom: i < alerts.length - 1 ? 3 : 0 }}>
+                {a.msg}
+              </div>
+            ))}
+          </div>
         </div>
-        <Button variant="danger" size="sm">Inspect →</Button>
-      </div>
+      )}
 
       {/* KPIs */}
       <div style={{ display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:12,marginBottom:20 }}>
-        <StatCard label="💰 MTD Spend"   value="$2,351" delta="↑ 28% vs last month"  deltaDir="down" color="var(--acid)" />
-        <StatCard label="📈 Projected/mo" value="$2,841" delta="$490 over budget"      deltaDir="down" color="var(--red)" alert />
-        <StatCard label="◎ Cost/1K out"  value="$3.14"  delta="↓ 6% efficiency gain"  deltaDir="up"   color="var(--text)" />
-        <StatCard label="♻ Waste"        value="$341"   delta="14.5% of total spend"  deltaDir="down" color="var(--red)" alert />
-        <StatCard label="⬡ Tokens/day"   value="48.2M"  delta="↑ 11% growth"          deltaDir="up"   color="var(--green)" />
+        <StatCard label="💰 MTD Spend"   value={money(spend.total_30d)} delta={`${Number(spend.total_calls || 0).toLocaleString()} calls`} color="var(--acid)" />
+        <StatCard label="📈 Projected/mo" value={money(proj.projected_total)}
+          delta={overBudget ? `${money(proj.over_by)} over budget` : `${money(Math.max(0, Number(proj.budget || 0) - Number(proj.projected_total || 0)))} under budget`}
+          deltaDir={overBudget ? 'down' : 'up'} color="var(--red)" alert={overBudget} />
+        <StatCard label="◎ Cost/1K tok"  value={costPer1k === null ? '—' : `$${costPer1k.toFixed(4)}`} delta={fmtTokens(totalTokens) + ' tokens'} color="var(--text)" />
+        <StatCard label="♻ Waste"        value={money(retryCost)} delta={`${waste.waste_pct || 0}% of spend · ${Number(waste.retry_count || 0)} retries`} deltaDir="down" color="var(--red)" alert={retryCost > 0} />
+        <StatCard label="⬡ Tokens/day"   value={fmtTokens(spend.avg_tokens_per_day)} delta={`${fmtTokens(totalTokens)} in range`} color="var(--green)" />
       </div>
 
       {/* Main grid */}
@@ -150,62 +205,66 @@ export default function SpendOverview() {
 
         {/* Model spend */}
         <Panel title="⬡ Spend by Model" subtitle="30d · click to drill down" action="All →">
-          <div style={{ display:'flex',flexDirection:'column',gap:5 }}>
-            {MODELS.map(m => {
-              const pColor = PROV_COLORS[m.provider] || 'var(--text3)'
-              return (
-                <div key={m.model}
-                  style={{ display:'grid',gridTemplateColumns:'8px 1fr auto auto auto',alignItems:'center',gap:10,padding:'10px 12px',background:'var(--base2)',border:`1px solid ${m.spike?'rgba(255,77,109,0.3)':m.waste?'rgba(255,140,66,0.25)':'var(--border)'}`,borderRadius:8,cursor:'pointer',transition:'all var(--t-fast)' }}
-                  onMouseEnter={e=>e.currentTarget.style.borderColor='var(--acid-glow)'}
-                  onMouseLeave={e=>e.currentTarget.style.borderColor=m.spike?'rgba(255,77,109,0.3)':m.waste?'rgba(255,140,66,0.25)':'var(--border)'}
-                >
-                  <div style={{ width:8,height:8,borderRadius:'50%',background:pColor,boxShadow:`0 0 5px ${pColor}88` }} />
-                  <div>
-                    <div style={{ fontSize:11,fontWeight:600,color:'var(--text)',fontFamily:'var(--font-mono)' }}>{m.model}</div>
-                    <div style={{ fontSize:9,color:'var(--text3)',marginTop:1 }}>{m.provider} · {m.features.join(', ')}</div>
-                  </div>
-                  <div style={{ display:'flex',gap:4 }}>
-                    {m.spike && <span className="chip chip-red" style={{ fontSize:9 }}>⚡ Spike</span>}
-                    {m.waste && <span className="chip chip-orange" style={{ fontSize:9 }}>♻ Waste</span>}
-                    {m.new   && <span className="chip chip-purple" style={{ fontSize:9 }}>◈ New</span>}
-                    {!m.spike && !m.waste && !m.new && <span className="chip chip-green" style={{ fontSize:9 }}>✓ Stable</span>}
-                  </div>
-                  <div style={{ fontSize:10,color:'var(--text2)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap' }}>{m.tokens}</div>
-                  <div style={{ fontSize:12,fontWeight:700,color:m.spike?'var(--red)':'var(--acid)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap',textAlign:'right' }}>${m.cost}</div>
-                </div>
-              )
-            })}
-          </div>
+          {models.length === 0
+            ? <EmptyState icon="⬡" title="No model spend yet" desc="Send your first event with ta.spend.track()" />
+            : <div style={{ display:'flex',flexDirection:'column',gap:5 }}>
+                {models.map(m => {
+                  const pColor = PROV_COLORS[m.provider] || 'var(--text3)'
+                  return (
+                    <div key={`${m.provider}/${m.model}`}
+                      style={{ display:'grid',gridTemplateColumns:'8px 1fr auto auto auto',alignItems:'center',gap:10,padding:'10px 12px',background:'var(--base2)',border:`1px solid ${m.spike?'rgba(255,77,109,0.3)':m.waste?'rgba(255,140,66,0.25)':'var(--border)'}`,borderRadius:8,cursor:'pointer',transition:'all var(--t-fast)' }}
+                      onMouseEnter={e=>e.currentTarget.style.borderColor='var(--acid-glow)'}
+                      onMouseLeave={e=>e.currentTarget.style.borderColor=m.spike?'rgba(255,77,109,0.3)':m.waste?'rgba(255,140,66,0.25)':'var(--border)'}
+                    >
+                      <div style={{ width:8,height:8,borderRadius:'50%',background:pColor,boxShadow:`0 0 5px ${pColor}88` }} />
+                      <div>
+                        <div style={{ fontSize:11,fontWeight:600,color:'var(--text)',fontFamily:'var(--font-mono)' }}>{m.model}</div>
+                        <div style={{ fontSize:9,color:'var(--text3)',marginTop:1 }}>{m.provider} · {(m.features || []).join(', ') || 'no feature'}</div>
+                      </div>
+                      <div style={{ display:'flex',gap:4 }}>
+                        {m.spike && <span className="chip chip-red" style={{ fontSize:9 }}>⚡ Spike</span>}
+                        {m.waste && <span className="chip chip-orange" style={{ fontSize:9 }}>♻ Waste</span>}
+                        {!m.spike && !m.waste && <span className="chip chip-green" style={{ fontSize:9 }}>✓ Stable</span>}
+                      </div>
+                      <div style={{ fontSize:10,color:'var(--text2)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap' }}>{m.tokens_h}</div>
+                      <div style={{ fontSize:12,fontWeight:700,color:m.spike?'var(--red)':'var(--acid)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap',textAlign:'right' }}>${m.cost}</div>
+                    </div>
+                  )
+                })}
+              </div>}
         </Panel>
 
         {/* Charts */}
         <div style={{ display:'flex',flexDirection:'column',gap:14 }}>
           <Panel title="◇ Daily Spend by Provider" subtitle="30d stacked">
-            <ResponsiveContainer width="100%" height={110}>
-              <BarChart data={DAILY} margin={{ top:4,right:4,bottom:0,left:-20 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="d" tick={{ fontSize:9,fill:'var(--text3)',fontFamily:'var(--font-mono)' }} tickLine={false} />
-                <YAxis tick={{ fontSize:9,fill:'var(--text3)' }} tickLine={false} tickFormatter={v=>`$${v}`} />
-                <Tooltip content={<ChartTip />} />
-                <Bar dataKey="anthropic" stackId="s" fill="rgba(201,169,110,0.75)" radius={[0,0,0,0]} name="Anthropic" />
-                <Bar dataKey="openai"    stackId="s" fill="rgba(16,163,127,0.65)"  radius={[0,0,0,0]} name="OpenAI" />
-                <Bar dataKey="google"    stackId="s" fill="rgba(66,133,244,0.55)"  radius={[0,0,0,0]} name="Google" />
-                <Bar dataKey="cohere"    stackId="s" fill="rgba(155,89,182,0.55)"  radius={[2,2,0,0]} name="Cohere" />
-              </BarChart>
-            </ResponsiveContainer>
+            {provRows.length === 0
+              ? <EmptyState icon="◇" title="No spend yet" desc="Send your first event with ta.spend.track()" />
+              : <ResponsiveContainer width="100%" height={110}>
+                  <BarChart data={provRows} margin={{ top:4,right:4,bottom:0,left:-20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis dataKey="d" tick={{ fontSize:9,fill:'var(--text3)',fontFamily:'var(--font-mono)' }} tickLine={false} />
+                    <YAxis tick={{ fontSize:9,fill:'var(--text3)' }} tickLine={false} tickFormatter={v=>`$${v}`} />
+                    <Tooltip content={<ChartTip />} />
+                    {provSeries.map(s => (
+                      <Bar key={s.key} dataKey={s.key} stackId="s" fill={s.color} radius={[2,2,0,0]} name={s.name} />
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>}
           </Panel>
           <Panel title="◎ Cost / Successful Output" subtitle="By feature · trend">
-            <ResponsiveContainer width="100%" height={90}>
-              <LineChart data={OUTPUT_COST} margin={{ top:4,right:4,bottom:0,left:-20 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="d" tick={{ fontSize:9,fill:'var(--text3)',fontFamily:'var(--font-mono)' }} tickLine={false} />
-                <YAxis tick={{ fontSize:9,fill:'var(--text3)' }} tickLine={false} tickFormatter={v=>`$${v.toFixed(3)}`} />
-                <Tooltip content={<ChartTip />} />
-                <Line type="monotone" dataKey="drafter"  stroke="var(--red)"   strokeWidth={2} dot={false} name="email-drafter" />
-                <Line type="monotone" dataKey="checkout" stroke="var(--acid)"  strokeWidth={1.5} dot={false} name="checkout-flow" />
-                <Line type="monotone" dataKey="support"  stroke="var(--green)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="support-bot" />
-              </LineChart>
-            </ResponsiveContainer>
+            {featRows.length === 0
+              ? <EmptyState icon="◎" title="No successful calls yet" desc="This chart plots cost per successful call, per feature, per day." />
+              : <ResponsiveContainer width="100%" height={90}>
+                  <LineChart data={featRows} margin={{ top:4,right:4,bottom:0,left:-20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis dataKey="d" tick={{ fontSize:9,fill:'var(--text3)',fontFamily:'var(--font-mono)' }} tickLine={false} />
+                    <YAxis tick={{ fontSize:9,fill:'var(--text3)' }} tickLine={false} tickFormatter={v=>`$${v.toFixed(3)}`} />
+                    <Tooltip content={<ChartTip />} />
+                    {featSeries.map(s => (
+                      <Line key={s.key} type="monotone" dataKey={s.key} stroke={s.color} strokeWidth={1.5} dot={false} name={s.name} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>}
           </Panel>
         </div>
 
@@ -213,17 +272,22 @@ export default function SpendOverview() {
         <Panel title="📈 Spend Projection" subtitle="30d horizon">
           <div style={{ display:'flex',flexDirection:'column',gap:0 }}>
             {[
-              { type:'now',    icon:'📅', label:'Month to date', detail:'$2,351 spent · 18 of 30 days', color:'var(--green)' },
-              { type:'trend',  icon:'📈', label:'7-day burn rate', detail:'$134/day · up from $94/day (+42%)', color:'var(--acid)' },
-              { type:'danger', icon:'⚠',  label:'Projected month-end', detail:'$2,841 total — $490 over $2,350 budget', color:'var(--red)', bold:true },
-              { type:'tip',    icon:'💡', label:'Fix: trim email-drafter prompts', detail:'8.2K → 2.1K tokens via RAG · saves $310/mo', color:'var(--green)' },
-              { type:'tip',    icon:'💡', label:'Fix: route legacy → gpt-4o-mini', detail:'93% quality at 12% cost · saves $140/mo', color:'var(--green)' },
+              { icon:'📅', label:'Month to date', detail:`${money(proj.mtd_spend)} spent · ${proj.days_elapsed || 0} of ${proj.days_in_month || 30} days`, color:'var(--green)' },
+              { icon:'📈', label:'Daily burn rate', detail:`${money(proj.daily_burn)}/day over ${proj.days_elapsed || 0} days`, color:'var(--acid)' },
+              { icon: overBudget ? '⚠' : '✓', label:'Projected month-end',
+                detail: overBudget
+                  ? `${money(proj.projected_total)} total — ${money(proj.over_by)} over ${money(proj.budget)} budget`
+                  : `${money(proj.projected_total)} total — within ${money(proj.budget)} budget`,
+                color: overBudget ? 'var(--red)' : 'var(--green)', bold: overBudget },
+              ...wasteItems.slice(0, 2).map(w => ({
+                icon:'💡', label:`Waste: ${w.src}`, detail:`${money(w.cost)} on failed calls · ${w.pct}% of that model's calls`, color:'var(--green)',
+              })),
             ].map((s, i, arr) => (
               <div key={i} style={{ display:'flex',gap:10,position:'relative',paddingBottom:2 }}>
                 {i < arr.length-1 && <div style={{ position:'absolute',left:15,top:30,bottom:-2,width:1,background:'linear-gradient(to bottom, var(--border2), transparent)' }} />}
                 <div style={{ width:30,height:30,borderRadius:'50%',border:`1.5px solid ${s.color}`,background:`${s.color}18`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,flexShrink:0,zIndex:1 }}>{s.icon}</div>
                 <div style={{ flex:1,paddingBottom:16 }}>
-                  <div style={{ fontSize:11,fontWeight:600,color:s.bold?'var(--red)':s.type==='tip'?'var(--green)':'var(--text)',fontFamily:'var(--font-mono)',marginBottom:2 }}>{s.label}</div>
+                  <div style={{ fontSize:11,fontWeight:600,color:s.bold?'var(--red)':'var(--text)',fontFamily:'var(--font-mono)',marginBottom:2 }}>{s.label}</div>
                   <div style={{ fontSize:10,color:'var(--text2)',lineHeight:1.55 }}>{s.detail}</div>
                 </div>
               </div>
@@ -237,83 +301,90 @@ export default function SpendOverview() {
 
         {/* Provider Health */}
         <Panel title="◈ Provider Health" action={<button onClick={()=>setShowConnect(true)} style={{ fontSize:11,color:'var(--acid)',background:'none',border:'none',cursor:'pointer',fontFamily:'var(--font-mono)' }}>+ Add key</button>}>
-          <table style={{ width:'100%',borderCollapse:'collapse' }}>
-            <thead>
-              <tr>{['Provider','Efficiency','Calls/d','Err%','Status'].map(h=>(
-                <th key={h} style={{ textAlign:'left',fontSize:9,color:'var(--text3)',textTransform:'uppercase',letterSpacing:'1.5px',paddingBottom:10,borderBottom:'1px solid var(--border)',fontWeight:600,fontFamily:'var(--font-mono)' }}>{h}</th>
-              ))}</tr>
-            </thead>
-            <tbody>
-              {[
-                { name:'OpenAI',    logo:'🟢', eff:88, calls:4821, err:'1.2%', status:'Clean',  sc:'green',  bg:'rgba(16,163,127,.15)' },
-                { name:'Anthropic', logo:'🟡', eff:61, calls:1203, err:'3.8%', status:'Spike',  sc:'red',    bg:'rgba(201,169,110,.15)' },
-                { name:'Google',    logo:'🔵', eff:94, calls:892,  err:'0.6%', status:'Clean',  sc:'green',  bg:'rgba(66,133,244,.12)'  },
-                { name:'Cohere',    logo:'🟣', eff:79, calls:341,  err:'0.9%', status:'New',    sc:'purple', bg:'rgba(155,89,182,.12)'  },
-              ].map(p => (
-                <tr key={p.name}>
-                  <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
-                    <div style={{ display:'flex',alignItems:'center',gap:7 }}>
-                      <div style={{ width:22,height:22,borderRadius:5,background:p.bg,display:'flex',alignItems:'center',justifyContent:'center',fontSize:11 }}>{p.logo}</div>
-                      <span style={{ fontSize:11,fontWeight:600,color:'var(--text)',fontFamily:'var(--font-mono)' }}>{p.name}</span>
-                    </div>
-                  </td>
-                  <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
-                    <div style={{ height:4,background:'var(--base3)',borderRadius:2,width:50,overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:5 }}>
-                      <div style={{ height:'100%',width:`${p.eff}%`,background:p.eff>85?'var(--green)':p.eff>70?'var(--acid)':'var(--red)',borderRadius:2 }} />
-                    </div>
-                    <span style={{ fontSize:10,color:p.eff>85?'var(--green)':p.eff>70?'var(--acid)':'var(--red)' }}>{p.eff}%</span>
-                  </td>
-                  <td style={{ fontSize:11,color:'var(--text2)',padding:'9px 0',borderBottom:'1px solid var(--border)',fontFamily:'var(--font-mono)' }}>{p.calls.toLocaleString()}</td>
-                  <td style={{ fontSize:11,color:parseFloat(p.err)>3?'var(--red)':'var(--green)',padding:'9px 0',borderBottom:'1px solid var(--border)',fontFamily:'var(--font-mono)' }}>{p.err}</td>
-                  <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
-                    <span className={`chip chip-${p.sc}`} style={{ fontSize:9 }}>{p.status}</span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {providers.length === 0
+            ? <EmptyState icon="◈" title="No providers yet" desc="Traffic appears here once you send events, or connect a key." />
+            : <table style={{ width:'100%',borderCollapse:'collapse' }}>
+                <thead>
+                  <tr>{['Provider','Efficiency','Calls','Err%','Status'].map(h=>(
+                    <th key={h} style={{ textAlign:'left',fontSize:9,color:'var(--text3)',textTransform:'uppercase',letterSpacing:'1.5px',paddingBottom:10,borderBottom:'1px solid var(--border)',fontWeight:600,fontFamily:'var(--font-mono)' }}>{h}</th>
+                  ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {providers.map(p => {
+                    const err = (100 - Number(p.efficiency ?? 100)).toFixed(1)
+                    const color = PROV_COLORS[p.provider] || 'var(--text3)'
+                    return (
+                      <tr key={p.provider}>
+                        <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
+                          <div style={{ display:'flex',alignItems:'center',gap:7 }}>
+                            <div style={{ width:22,height:22,borderRadius:5,background:'var(--base3)',display:'flex',alignItems:'center',justifyContent:'center' }}>
+                              <div style={{ width:8,height:8,borderRadius:'50%',background:color }} />
+                            </div>
+                            <span style={{ fontSize:11,fontWeight:600,color:'var(--text)',fontFamily:'var(--font-mono)' }}>{p.provider}</span>
+                          </div>
+                        </td>
+                        <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
+                          <div style={{ height:4,background:'var(--base3)',borderRadius:2,width:50,overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:5 }}>
+                            <div style={{ height:'100%',width:`${p.efficiency}%`,background:p.efficiency>85?'var(--green)':p.efficiency>70?'var(--acid)':'var(--red)',borderRadius:2 }} />
+                          </div>
+                          <span style={{ fontSize:10,color:p.efficiency>85?'var(--green)':p.efficiency>70?'var(--acid)':'var(--red)' }}>{p.efficiency}%</span>
+                        </td>
+                        <td style={{ fontSize:11,color:'var(--text2)',padding:'9px 0',borderBottom:'1px solid var(--border)',fontFamily:'var(--font-mono)' }}>{Number(p.calls).toLocaleString()}</td>
+                        <td style={{ fontSize:11,color:parseFloat(err)>3?'var(--red)':'var(--green)',padding:'9px 0',borderBottom:'1px solid var(--border)',fontFamily:'var(--font-mono)' }}>{err}%</td>
+                        <td style={{ padding:'9px 0',borderBottom:'1px solid var(--border)' }}>
+                          <span className={`chip ${p.connected ? 'chip-green' : 'chip-muted'}`} style={{ fontSize:9 }}>{p.connected ? 'Key linked' : 'No key'}</span>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>}
         </Panel>
 
         {/* Spend by Feature */}
-        <Panel title="◈ Spend by Feature" subtitle="30d · $2,351 total">
-          <div style={{ display:'flex',flexDirection:'column',gap:9 }}>
-            {[
-              { name:'email-drafter', pct:38, cost:'$891', color:'var(--red)' },
-              { name:'checkout-flow', pct:26, cost:'$612', color:'var(--acid)' },
-              { name:'support-bot',   pct:18, cost:'$423', color:'var(--green)' },
-              { name:'doc-summariser',pct:10, cost:'$241', color:'var(--purple)' },
-              { name:'rag-pipeline',  pct:8,  cost:'$184', color:'var(--text3)' },
-            ].map(f => (
-              <div key={f.name} style={{ display:'flex',alignItems:'center',gap:8,fontSize:11 }}>
-                <div style={{ color:'var(--text2)',flex:1,fontFamily:'var(--font-mono)',fontSize:10,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{f.name}</div>
-                <div style={{ flex:2,height:6,background:'var(--base3)',borderRadius:3,overflow:'hidden' }}>
-                  <div style={{ height:'100%',width:`${f.pct}%`,background:f.color,borderRadius:3,transition:'width 0.8s ease' }} />
-                </div>
-                <div style={{ color:f.color,fontWeight:600,width:44,textAlign:'right',fontSize:11,fontFamily:'var(--font-mono)' }}>{f.cost}</div>
-              </div>
-            ))}
-          </div>
+        <Panel title="◈ Spend by Feature" subtitle={`30d · ${money(totalSpend)} total`}>
+          {features.length === 0
+            ? <EmptyState icon="◈" title="No feature spend yet" desc="Send events with a feature name to break spend down here." />
+            : <div style={{ display:'flex',flexDirection:'column',gap:9 }}>
+                {features.map((f, i) => {
+                  const cost = Number(f.cost || 0)
+                  const pct = featureTotal > 0 ? Math.round(cost / featureTotal * 100) : 0
+                  const color = FEATURE_COLORS[i % FEATURE_COLORS.length]
+                  return (
+                    <div key={f.feature} style={{ display:'flex',alignItems:'center',gap:8,fontSize:11 }}>
+                      <div style={{ color:'var(--text2)',flex:1,fontFamily:'var(--font-mono)',fontSize:10,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>{f.feature}</div>
+                      <div style={{ flex:2,height:6,background:'var(--base3)',borderRadius:3,overflow:'hidden' }}>
+                        <div style={{ height:'100%',width:`${pct}%`,background:color,borderRadius:3,transition:'width 0.8s ease' }} />
+                      </div>
+                      <div style={{ color,fontWeight:600,width:64,textAlign:'right',fontSize:11,fontFamily:'var(--font-mono)' }}>{money(cost)}</div>
+                    </div>
+                  )
+                })}
+              </div>}
         </Panel>
 
         {/* Waste Finder */}
-        <Panel title="♻ Waste Finder" action={<span style={{ fontSize:11,color:'var(--acid)',cursor:'pointer',fontFamily:'var(--font-mono)' }}>Fix all → $513</span>}>
-          <div style={{ display:'flex',flexDirection:'column',gap:8 }}>
-            {WASTE.map((w,i) => (
-              <div key={i} style={{ background:'var(--base2)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',cursor:'pointer',transition:'border-color var(--t-fast)' }}
-                onMouseEnter={e=>e.currentTarget.style.borderColor='var(--acid-glow)'}
-                onMouseLeave={e=>e.currentTarget.style.borderColor='var(--border)'}
-              >
-                <div style={{ display:'flex',justifyContent:'space-between',marginBottom:4 }}>
-                  <span style={{ fontSize:10,fontWeight:700,color:'var(--acid)',fontFamily:'var(--font-mono)' }}>{w.src}</span>
-                  <span style={{ fontSize:13,fontWeight:800,color:'var(--red)',fontFamily:'var(--font-display)' }}>${w.saving}/mo</span>
-                </div>
-                <div style={{ fontSize:10,color:'var(--text2)',lineHeight:1.45,display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden' }}>{w.desc}</div>
-                <div style={{ marginTop:6,height:2,background:'var(--border)',borderRadius:1,overflow:'hidden' }}>
-                  <div style={{ height:'100%',width:`${w.pct}%`,background:'linear-gradient(90deg,var(--red),var(--acid))',transition:'width 0.8s ease' }} />
-                </div>
-              </div>
-            ))}
-          </div>
+        <Panel title="♻ Waste Finder" action={wasteItems.length > 0 ? <span style={{ fontSize:11,color:'var(--acid)',cursor:'pointer',fontFamily:'var(--font-mono)' }}>Total → {money(retryCost)}</span> : null}>
+          {wasteItems.length === 0
+            ? <EmptyState icon="♻" title="No waste detected" desc="No failed calls in this window. Waste appears when success:false rows exist." />
+            : <div style={{ display:'flex',flexDirection:'column',gap:8 }}>
+                {wasteItems.map((w,i) => (
+                  <div key={i} style={{ background:'var(--base2)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',cursor:'pointer',transition:'border-color var(--t-fast)' }}
+                    onMouseEnter={e=>e.currentTarget.style.borderColor='var(--acid-glow)'}
+                    onMouseLeave={e=>e.currentTarget.style.borderColor='var(--border)'}
+                  >
+                    <div style={{ display:'flex',justifyContent:'space-between',marginBottom:4 }}>
+                      <span style={{ fontSize:10,fontWeight:700,color:'var(--acid)',fontFamily:'var(--font-mono)' }}>{w.src}</span>
+                      <span style={{ fontSize:13,fontWeight:800,color:'var(--red)',fontFamily:'var(--font-display)' }}>{money(w.cost)}</span>
+                    </div>
+                    <div style={{ fontSize:10,color:'var(--text2)',lineHeight:1.45,display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden' }}>{w.desc}</div>
+                    <div style={{ marginTop:6,height:2,background:'var(--border)',borderRadius:1,overflow:'hidden' }}>
+                      <div style={{ height:'100%',width:`${w.pct}%`,background:'linear-gradient(90deg,var(--red),var(--acid))',transition:'width 0.8s ease' }} />
+                    </div>
+                  </div>
+                ))}
+              </div>}
         </Panel>
       </div>
 
