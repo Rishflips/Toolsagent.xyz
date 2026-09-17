@@ -147,6 +147,23 @@ async function requireAnyAuth(req, res, next) {
 function ok(res, data, status = 200) { return res.status(status).json(data); }
 function err(res, msg, status = 400) { return res.status(status).json({ error: msg }); }
 
+// Compact token counts for display: 18.4M, 1.2B, 940, 12.5K
+function formatTokens(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+// Cost for display. Never round a real cost down to 0.00 — a sub-cent model
+// shown as "$0.00" reads as free, which is the fake-number problem this
+// dashboard exists to remove.
+function formatCost(n) {
+  if (!Number.isFinite(n) || n === 0) return '0.00';
+  if (n < 0.01) return n.toFixed(4);
+  return n.toFixed(2);
+}
+
 const KEY_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 
 // ── HEALTH ────────────────────────────────────────────────────────
@@ -329,18 +346,148 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
 
   try {
     const orgId = req.org.id;
-    const [totR, provR, featR, wasteR, projR] = await Promise.all([
+    const [totR, provR, featR, wasteR, projR, dailyR, modelR, outputCostR] = await Promise.all([
       db(`SELECT COALESCE(SUM(cost_usd),0) as total, COUNT(*) as calls, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'`, [orgId]),
-      db(`SELECT provider, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY provider ORDER BY cost DESC`, [orgId]),
+      db(`SELECT provider, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls, COUNT(*) FILTER (WHERE NOT success) as failed, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY provider ORDER BY cost DESC`, [orgId]),
       db(`SELECT feature, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY feature ORDER BY cost DESC`, [orgId]),
       db(`SELECT COUNT(*) as retry_count, COALESCE(SUM(cost_usd),0) as retry_cost FROM spend_events WHERE org_id=$1 AND success=false AND created_at > NOW()-INTERVAL '${interval}'`, [orgId]),
       db(`SELECT COALESCE(SUM(cost_usd),0)/GREATEST(EXTRACT(DAY FROM NOW()-DATE_TRUNC('month',NOW())),1) as daily_burn FROM spend_events WHERE org_id=$1 AND DATE_TRUNC('month',created_at)=DATE_TRUNC('month',NOW())`, [orgId]),
+      // Daily series for the stacked-provider chart.
+      db(`SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS day,
+                 provider,
+                 COALESCE(SUM(cost_usd),0) AS cost
+          FROM spend_events
+          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          GROUP BY day, provider
+          ORDER BY day ASC`, [orgId]),
+      // Per-model rollup for the models table.
+      db(`SELECT model,
+                 provider,
+                 COALESCE(SUM(input_tokens+output_tokens),0) AS tokens,
+                 COALESCE(SUM(cost_usd),0) AS cost,
+                 COUNT(*) AS calls,
+                 COUNT(*) FILTER (WHERE NOT success) AS failed_calls,
+                 ARRAY_AGG(DISTINCT feature) AS features
+          FROM spend_events
+          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          GROUP BY model, provider
+          ORDER BY cost DESC
+          LIMIT 50`, [orgId]),
+      // Average cost per SUCCESSFUL call, per feature, per day.
+      db(`SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS day,
+                 feature,
+                 COALESCE(SUM(cost_usd),0)
+                   / GREATEST(COUNT(*) FILTER (WHERE success), 1) AS avg_cost
+          FROM spend_events
+          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          GROUP BY day, feature
+          ORDER BY day ASC`, [orgId]),
     ]);
 
     const dailyBurn  = parseFloat(projR.rows[0]?.daily_burn || 0);
     const daysLeft   = 30 - new Date().getDate();
     const mtdSpend   = parseFloat(totR.rows[0]?.total || 0);
     const projected  = mtdSpend + dailyBurn * daysLeft;
+
+    // Pivot [{day, provider, cost}] into [{d, openai, anthropic, ...}]
+    const byDay = new Map();
+    for (const r of dailyR.rows) {
+      if (!byDay.has(r.day)) byDay.set(r.day, { d: r.day });
+      byDay.get(r.day)[r.provider] = parseFloat(r.cost).toFixed(4);
+    }
+    const daily_spend = [...byDay.values()];
+
+    // Per-model rollup.
+    const by_model = modelR.rows.map(r => ({
+      model:        r.model,
+      provider:     r.provider,
+      features:     r.features || [],
+      tokens:       Number(r.tokens),
+      tokens_h:     formatTokens(Number(r.tokens)),
+      cost:         formatCost(parseFloat(r.cost)),
+      calls:        Number(r.calls),
+      spike:        false,   // filled in below
+      waste:        Number(r.failed_calls) > 0,
+      new:          false,
+    }));
+
+    // A model is spiking if its cost is more than 2x the mean model cost.
+    if (by_model.length > 1) {
+      const mean = by_model.reduce((s, m) => s + parseFloat(m.cost), 0) / by_model.length;
+      for (const m of by_model) m.spike = mean > 0 && parseFloat(m.cost) > mean * 2;
+    }
+
+    // Waste items come from real failed-call rows, not a static list.
+    const wasteItems = modelR.rows
+      .filter(r => Number(r.failed_calls) > 0)
+      .map(r => ({
+        src:   `${r.features?.[0] || 'unknown'} · ${r.model}`,
+        cost:  formatCost(parseFloat(r.cost)),
+        count: Number(r.failed_calls),
+        pct:   Math.round(Number(r.failed_calls) / Number(r.calls) * 100),
+        desc:  `${r.failed_calls} of ${r.calls} calls to ${r.model} failed. `
+             + `Check for context-length or rate-limit errors before the call is made.`,
+      }))
+      .sort((a, b) => b.pct - a.pct)
+      .slice(0, 10);
+
+    // Pivot [{day, feature, avg_cost}] -> [{d, 'email-drafter': 0.011, ...}]
+    // Only the top 5 features by spend get their own line; the rest are folded
+    // into "other" so the legend stays readable.
+    const featureTotals = new Map();
+    for (const r of outputCostR.rows) {
+      featureTotals.set(r.feature,
+        (featureTotals.get(r.feature) || 0) + parseFloat(r.avg_cost));
+    }
+    const topFeatures = new Set(
+      [...featureTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(e => e[0])
+    );
+
+    const byDayCost = new Map();
+    for (const r of outputCostR.rows) {
+      if (!byDayCost.has(r.day)) byDayCost.set(r.day, { d: r.day });
+      const key = topFeatures.has(r.feature) ? r.feature : 'other';
+      byDayCost.get(r.day)[key] = parseFloat(parseFloat(r.avg_cost).toFixed(6));
+    }
+    const output_cost = [...byDayCost.values()];
+
+    // Providers come from observed traffic; "connected" means a key row exists.
+    const providers = provR.rows.map(r => ({
+      provider: r.provider,
+      cost:     formatCost(parseFloat(r.cost)),
+      calls:    Number(r.calls),
+      tokens:   Number(r.tokens),
+      connected: false,
+      efficiency: Number(r.calls) > 0
+        ? Math.round((1 - Number(r.failed || 0) / Number(r.calls)) * 100)
+        : 100,
+    }));
+
+    const keyR = await db(
+      `SELECT DISTINCT provider FROM provider_keys WHERE org_id=$1 AND active=true`,
+      [orgId]
+    );
+    const connectedSet = new Set(keyR.rows.map(r => r.provider));
+    for (const p of providers) p.connected = connectedSet.has(p.provider);
+
+    // Active alerts are derived from the live projection and spike flags.
+    const alertR = await db(
+      `SELECT spike_multiplier, budget_limit, slack_webhook FROM alert_rules
+       WHERE org_id=$1 LIMIT 1`, [orgId]
+    );
+    const active_alerts = [];
+    const rule = alertR.rows[0];
+    if (rule) {
+      if (projected > parseFloat(rule.budget_limit)) {
+        active_alerts.push({
+          level: 'error',
+          msg: `Projected $${projected.toFixed(2)} exceeds budget $${rule.budget_limit}`,
+        });
+      }
+      for (const m of by_model.filter(x => x.spike).slice(0, 3)) {
+        active_alerts.push({ level: 'warn', msg: `Spike: ${m.model} cost above 2x average` });
+      }
+    }
 
     ok(res, {
       spend: {
@@ -352,13 +499,13 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
       },
       by_provider: provR.rows,
       by_feature:  featR.rows,
-      by_model:    [],
+      by_model,
       waste: {
         retry_count:      wasteR.rows[0]?.retry_count || '0',
         retry_cost:       parseFloat(wasteR.rows[0]?.retry_cost || 0).toFixed(2),
         total_waste_cost: parseFloat(wasteR.rows[0]?.retry_cost || 0).toFixed(2),
         waste_pct:        mtdSpend > 0 ? (parseFloat(wasteR.rows[0]?.retry_cost||0)/mtdSpend*100).toFixed(1) : '0',
-        items: [],
+        items: wasteItems,
       },
       projection: {
         mtd_spend:       mtdSpend.toFixed(2),
@@ -371,13 +518,15 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
         over_budget:     projected > 100,
         over_by:         Math.max(0, projected - 100).toFixed(2),
       },
-      daily_spend:    [],
-      providers:      [],
-      active_alerts:  [],
+      daily_spend,
+      output_cost,
+      providers,
+      active_alerts,
       plan:           { name: 'free', calls_used: parseInt(totR.rows[0]?.calls||0), calls_limit: 10000 },
-      providers_connected: 0,
+      providers_connected: connectedSet.size,
     });
   } catch (e) {
+    console.error('Spend dashboard error:', e.message);
     err(res, 'Dashboard error', 500);
   }
 });
@@ -426,15 +575,48 @@ app.delete('/api/v1/spend/keys/:keyId', apiLimiter, requireAuth, async (req, res
 app.post('/api/v1/spend/alerts', apiLimiter, requireAuth, async (req, res) => {
   const { spike_multiplier, budget_limit, slack_webhook } = req.body;
   if (slack_webhook && !slack_webhook.startsWith('https://')) return err(res, 'slack_webhook must be https://');
+  const spike  = Math.max(1, parseFloat(spike_multiplier) || 2);
+  const budget = Math.max(0, parseFloat(budget_limit) || 100);
+  const hook   = slack_webhook || null;
+
   try {
-    await db(
-      `INSERT INTO alert_rules (id, org_id, spike_multiplier, budget_limit, slack_webhook)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (org_id) DO UPDATE SET spike_multiplier=$3, budget_limit=$4, slack_webhook=$5, updated_at=NOW()`,
-      [uuid(), req.org.id, Math.max(1, parseFloat(spike_multiplier)||2), Math.max(0, parseFloat(budget_limit)||100), slack_webhook||null]
+    // UPDATE-then-INSERT rather than ON CONFLICT: a DB created from an earlier
+    // schema has no unique constraint on alert_rules(org_id), and ON CONFLICT
+    // against a missing constraint fails with 42P10 — which made this endpoint
+    // return 500 for every caller. One rule row per org is the invariant either
+    // way, and this cannot break on an older database.
+    const upd = await db(
+      `UPDATE alert_rules SET spike_multiplier=$2, budget_limit=$3, slack_webhook=$4, updated_at=NOW()
+       WHERE org_id=$1`,
+      [req.org.id, spike, budget, hook]
     );
-    ok(res, { success: true });
+
+    if (upd.rowCount === 0) {
+      await db(
+        `INSERT INTO alert_rules (id, org_id, spike_multiplier, budget_limit, slack_webhook)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [uuid(), req.org.id, spike, budget, hook]
+      );
+    }
+
+    // Read back what is actually stored — never report success on a write we
+    // did not confirm.
+    const { rows } = await db(
+      `SELECT spike_multiplier, budget_limit, slack_webhook FROM alert_rules WHERE org_id=$1`,
+      [req.org.id]
+    );
+    if (!rows.length) return err(res, 'Alert rule not saved', 500);
+
+    ok(res, {
+      success: true,
+      rule: {
+        spike_multiplier: parseFloat(rows[0].spike_multiplier),
+        budget_limit:     parseFloat(rows[0].budget_limit),
+        slack_webhook:    rows[0].slack_webhook,
+      },
+    });
   } catch (e) {
+    console.error('Alert config error:', e.message);
     err(res, 'Failed to configure alerts', 500);
   }
 });
