@@ -104,6 +104,9 @@ export function SignupPage() {
   const { signup } = useAuth()
   const navigate   = useNavigate()
   const [form, setForm]   = useState({ name: '', email: '', password: '' })
+  const [confirmNewOrg, setConfirmNewOrg] = useState(false)
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [showLoginLink, setShowLoginLink] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -111,11 +114,18 @@ export function SignupPage() {
     e.preventDefault()
     if (form.password.length < 8) { setError('Password must be at least 8 characters'); return }
     setError(''); setLoading(true)
+    setShowConfirm(false)
+    setShowLoginLink(false)
     try {
-      await signup(form.name, form.email, form.password)
+      await signup(form.name, form.email, form.password, confirmNewOrg)
       navigate('/observe')
     } catch (err) {
       setError(err.message)
+      if (err.code === 'ORG_EXISTS') {
+        setShowConfirm(true)
+      } else if (err.code === 'EMAIL_EXISTS') {
+        setShowLoginLink(true)
+      }
     } finally {
       setLoading(false)
     }
@@ -138,9 +148,37 @@ export function SignupPage() {
           <div>10K traces · 30d history · 3 API keys</div>
         </div>
 
-        {error && <div style={{ fontSize: 11, color: 'var(--red)', fontFamily: 'var(--font-mono)', background: 'var(--red-dim)', padding: '8px 10px', borderRadius: 6 }}>{error}</div>}
+        {error && (
+          <div style={{
+            fontSize: 11, color: 'var(--red)', fontFamily: 'var(--font-mono)',
+            background: 'var(--red-dim)', padding: '10px 12px', borderRadius: 6,
+            lineHeight: 1.5,
+          }}>
+            <div style={{ marginBottom: (showConfirm || showLoginLink) ? 8 : 0 }}>{error}</div>
+            {(showConfirm || showLoginLink) && (
+              <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 8, marginTop: 8 }}>
+                <div style={{ marginBottom: showConfirm ? 8 : 0 }}>
+                  <Link to="/login" style={{ color: 'var(--acid)', textDecoration: 'underline' }}>
+                    Sign in to existing account →
+                  </Link>
+                </div>
+                {showConfirm && (
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', color: 'var(--text)' }}>
+                    <input
+                      type="checkbox"
+                      checked={confirmNewOrg}
+                      onChange={e => setConfirmNewOrg(e.target.checked)}
+                      style={{ accentColor: 'var(--acid)', cursor: 'pointer' }}
+                    />
+                    <span>Create a separate, isolated organization</span>
+                  </label>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         <Button type="submit" variant="primary" loading={loading} style={{ width: '100%', marginTop: 4 }}>
-          Create account →
+          {confirmNewOrg ? 'Create separate organization →' : 'Create account →'}
         </Button>
         <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>
           Already have an account? <Link to="/login" style={{ color: 'var(--acid)', textDecoration: 'none' }}>Sign in</Link>

@@ -264,7 +264,11 @@ async function requireAnyAuth(req, res, next) {
 
 // ── HELPERS ───────────────────────────────────────────────────────
 function ok(res, data, status = 200) { return res.status(status).json(data); }
-function err(res, msg, status = 400) { return res.status(status).json({ error: msg }); }
+function err(res, msg, status = 400, code = null) {
+  const body = { error: msg };
+  if (code) body.code = code;
+  return res.status(status).json(body);
+}
 
 // Compact token counts for display: 18.4M, 1.2B, 940, 12.5K
 function formatTokens(n) {
@@ -305,6 +309,43 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
   if (password.length < 8) return err(res, 'Password must be at least 8 characters');
 
   try {
+    const normEmail = String(email).trim().toLowerCase();
+
+    // Check if user or org with this email already exists
+    const { rows: existingUsers } = await db(
+      `SELECT u.id FROM users u WHERE LOWER(u.email) = $1 UNION SELECT o.id FROM orgs o WHERE LOWER(o.email) = $1`,
+      [normEmail]
+    );
+    if (existingUsers.length > 0) {
+      return err(res, 'Email already registered', 400, 'EMAIL_EXISTS');
+    }
+
+    // Detect existing instance state
+    const { rows: existingOrgs } = await db(`SELECT id, name, email, created_at FROM orgs ORDER BY created_at ASC`);
+    const confirmNewOrg =
+      req.body?.confirm_new_org === true ||
+      req.body?.confirm_new_org === 'true' ||
+      req.body?.confirmNewOrg === true ||
+      req.body?.confirmNewOrg === 'true' ||
+      req.query?.confirm_new_org === 'true' ||
+      req.query?.confirm_new_org === '1';
+
+    if (existingOrgs.length > 0 && !confirmNewOrg) {
+      const primaryOrg = existingOrgs[0];
+      const orgCount = existingOrgs.length;
+      const orgDesc = orgCount === 1
+        ? `An organization already exists on this instance ("${primaryOrg.name}").`
+        : `${orgCount} organizations already exist on this instance (initial: "${primaryOrg.name}").`;
+
+      return res.status(409).json({
+        error: `${orgDesc} If you are returning to your existing workspace, sign in at /login with your existing account to access your data. If you are a different person and need a new isolated organization, confirm by passing confirm_new_org: true.`,
+        code: 'ORG_EXISTS',
+        existing_org: primaryOrg.name,
+        org_count: orgCount,
+        hint: 'Sign in at /login to access existing data, or submit with confirm_new_org: true to create a new separate organization.',
+      });
+    }
+
     const hash = await bcrypt.hash(password, 12);
     const orgId  = uuid();
     const userId = uuid();
@@ -312,12 +353,12 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
     await db('BEGIN');
 
     // Create org
-    await db(`INSERT INTO orgs (id, name, email) VALUES ($1, $2, $3)`, [orgId, name, email]);
+    await db(`INSERT INTO orgs (id, name, email) VALUES ($1, $2, $3)`, [orgId, name.trim(), normEmail]);
 
     // Create user
     await db(
       `INSERT INTO users (id, org_id, name, email, password_hash, role) VALUES ($1,$2,$3,$4,$5,'owner')`,
-      [userId, orgId, name, email, hash]
+      [userId, orgId, name.trim(), normEmail, hash]
     );
 
     // Generate API key
@@ -332,11 +373,11 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
 
     await db('COMMIT');
 
-    const token = jwt.sign({ orgId, userId, email, name }, JWT_SECRET, { expiresIn: '30d' });
-    ok(res, { token, user: { id: userId, name, email, plan: 'free' }, api_key: raw }, 201);
+    const token = jwt.sign({ orgId, userId, email: normEmail, name: name.trim() }, JWT_SECRET, { expiresIn: '30d' });
+    ok(res, { token, user: { id: userId, name: name.trim(), email: normEmail, plan: 'free' }, api_key: raw }, 201);
   } catch (e) {
     await db('ROLLBACK');
-    if (e.code === '23505') return err(res, 'Email already registered');
+    if (e.code === '23505') return err(res, 'Email already registered', 400, 'EMAIL_EXISTS');
     console.error('Signup error:', e.message);
     err(res, 'Signup failed', 500);
   }
