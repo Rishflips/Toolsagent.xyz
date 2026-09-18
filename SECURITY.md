@@ -8,13 +8,13 @@ Please open a private security advisory on GitHub rather than a public issue.
 
 ## Secrets
 
-`JWT_SECRET` and `ENCRYPTION_SECRET` are **required** and have no defaults. The
-server exits with a clear error if either is missing, too short, or set to a
-placeholder value from `.env.example`. This is deliberate: a default published in
-a public repo would let anyone forge a valid login token on every deployment that
-forgot to change it.
+`JWT_SECRET` and `ENCRYPTION_SECRET` can be configured via environment variables
+or generated automatically on first boot and persisted into the mounted data volume
+(`backend_data:/data/secret`, with permissions `0600`).
+If provided in environment variables, the server validates that they are not insecure
+placeholders or too short (< 32 characters).
 
-Generate both with:
+To manually generate secrets:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"

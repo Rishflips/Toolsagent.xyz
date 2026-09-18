@@ -24,12 +24,10 @@ Three essential tools for AI agent developers — merged into one console:
 ```bash
 git clone https://github.com/Rishflips/Toolsagent.xyz
 cd Toolsagent.xyz
-cp .env.example .env
-# Generate the two required secrets (the server refuses to start without them):
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # JWT_SECRET
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # ENCRYPTION_SECRET
 docker compose up
 ```
+
+Secrets (`JWT_SECRET` and `ENCRYPTION_SECRET`) are generated and persisted automatically on first boot. Custom configuration can optionally be set via `.env` (see `.env.example`).
 
 Open **http://localhost:3000** → Create account → Get API key → Start tracking.
 
@@ -116,7 +114,7 @@ toolsagent/
 
 1. Fork the repo
 2. `git clone` your fork
-3. `cp .env.example .env && docker compose up`
+3. `docker compose up`
 4. Create a feature branch: `git checkout -b feat/your-feature`
 5. Open a PR
 
