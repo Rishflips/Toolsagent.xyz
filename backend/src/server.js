@@ -164,6 +164,16 @@ function formatCost(n) {
   return n.toFixed(2);
 }
 
+// Human duration from milliseconds. Traces range from ~800ms to ~4 minutes,
+// and a single fixed unit reads wrong at both ends.
+function formatDuration(ms) {
+  const n = Number(ms) || 0;
+  if (n < 1000)    return `${Math.round(n)}ms`;
+  if (n < 60000)   return `${(n / 1000).toFixed(1)}s`;
+  const m = Math.floor(n / 60000);
+  return `${m}m ${Math.round((n % 60000) / 1000)}s`;
+}
+
 const KEY_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 
 // ── HEALTH ────────────────────────────────────────────────────────
@@ -277,14 +287,23 @@ app.post('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) 
 app.get('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) => {
   const { limit = 50, offset = 0, agent, status } = req.query;
   try {
-    let q = `SELECT id, agent, task, model, status, duration_ms, cost_usd, flags, started_at FROM traces WHERE org_id = $1`;
+    // steps + cost + duration come back formatted so the UI never has to guess
+    // the display rule. Day 8 moves steps behind a single-trace detail endpoint;
+    // at 50 rows of small JSON it is cheap enough to inline today.
+    let q = `SELECT id, agent, task, model, status, duration_ms, cost_usd, flags, steps, started_at
+             FROM traces WHERE org_id = $1`;
     const params = [req.org.id];
     if (agent)  { params.push(agent);  q += ` AND agent = $${params.length}`; }
     if (status) { params.push(status); q += ` AND status = $${params.length}`; }
     q += ` ORDER BY started_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
     params.push(Math.min(parseInt(limit)||50, 200), Math.max(parseInt(offset)||0, 0));
     const { rows } = await db(q, params);
-    ok(res, { traces: rows });
+    ok(res, { traces: rows.map(t => ({
+      ...t,
+      cost:     formatCost(parseFloat(t.cost_usd)),
+      duration: formatDuration(t.duration_ms),
+      steps:    Array.isArray(t.steps) ? t.steps : [],
+    })) });
   } catch (e) {
     err(res, 'Failed to fetch traces', 500);
   }
@@ -293,24 +312,82 @@ app.get('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) =
 app.get('/api/v1/observe/dashboard', apiLimiter, requireAnyAuth, async (req, res) => {
   try {
     const orgId = req.org.id;
-    const [totalR, flagsR, costR, agentsR] = await Promise.all([
+    const [totalR, flagsR, costR, agentsR, prevR, bucketR, hallR] = await Promise.all([
       db(`SELECT COUNT(*) as total, AVG(duration_ms) as avg_lat FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h'`, [orgId]),
       db(`SELECT COUNT(*) as flags FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h' AND status != 'success'`, [orgId]),
       db(`SELECT COALESCE(SUM(cost_usd),0) as total FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h'`, [orgId]),
       db(`SELECT agent, COUNT(*) as runs, AVG(cost_usd) as avg_cost, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/COUNT(*) as health FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '1h' GROUP BY agent`, [orgId]),
+      // Previous 6h window, so the KPI deltas are measured rather than invented.
+      db(`SELECT COUNT(*) as total FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '12h' AND started_at <= NOW()-INTERVAL '6h'`, [orgId]),
+      // Real 30-minute buckets over the last 6h. generate_series LEFT JOINed to
+      // traces so a quiet half hour shows as 0 instead of the axis shifting.
+      // The series ENDS at the bucket containing NOW(), not at the top of the
+      // hour: ending on the hour drops the current half hour, so a trace logged
+      // two minutes ago would not appear on its own chart until the next
+      // half-hour tick. That exact off-by-one-bucket was caught in verification.
+      db(`WITH b AS (
+            SELECT generate_series(
+                     DATE_TRUNC('hour', NOW())
+                       + (INTERVAL '30 minutes' * FLOOR(EXTRACT(MINUTE FROM NOW()) / 30))
+                       - INTERVAL '5 hours 30 minutes',
+                     DATE_TRUNC('hour', NOW())
+                       + (INTERVAL '30 minutes' * FLOOR(EXTRACT(MINUTE FROM NOW()) / 30)),
+                     INTERVAL '30 minutes') AS bucket
+          )
+          SELECT TO_CHAR(b.bucket, 'HH24:MI') AS t,
+                 COUNT(t.id)::int AS traces,
+                 COUNT(t.id) FILTER (WHERE t.status <> 'success')::int AS flags,
+                 COALESCE(ROUND(PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY t.duration_ms)), 0)::int AS p50_ms,
+                 COALESCE(ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.duration_ms)), 0)::int AS p95_ms
+          FROM b
+          LEFT JOIN traces t ON t.org_id = $1
+               AND t.started_at >= b.bucket
+               AND t.started_at <  b.bucket + INTERVAL '30 minutes'
+          GROUP BY b.bucket ORDER BY b.bucket`, [orgId]),
+      // Hallucination radar reads the real table. The write path lands on Day 10,
+      // so today this is honestly empty rather than three invented rows.
+      db(`SELECT h.id, h.agent, h.confidence, h.excerpt, h.reviewed, h.created_at
+          FROM hallucinations h
+          WHERE h.org_id=$1 AND h.created_at > NOW()-INTERVAL '6h'
+          ORDER BY h.confidence DESC LIMIT 3`, [orgId]),
     ]);
 
+    const total6h  = parseInt(totalR.rows[0]?.total || 0);
+    const prev6h   = parseInt(prevR.rows[0]?.total || 0);
+    const hall6h   = hallR.rows.length;
+
     ok(res, {
-      traces_6h:    parseInt(totalR.rows[0]?.total || 0),
-      avg_latency:  `${Math.round(parseFloat(totalR.rows[0]?.avg_lat || 0) / 1000 * 10) / 10}s`,
-      success_rate: totalR.rows[0]?.total > 0
-        ? `${(100 - parseFloat(flagsR.rows[0]?.flags || 0) / parseFloat(totalR.rows[0]?.total) * 100).toFixed(1)}%`
+      traces_6h:    total6h,
+      traces_prev_6h: prev6h,
+      avg_latency:  formatDuration(totalR.rows[0]?.avg_lat || 0),
+      success_rate: total6h > 0
+        ? `${(100 - parseFloat(flagsR.rows[0]?.flags || 0) / total6h * 100).toFixed(1)}%`
         : '100%',
-      halluc_rate:  '0.00%',
-      cost_6h:      `$${parseFloat(costR.rows[0]?.total || 0).toFixed(2)}`,
-      agents:       agentsR.rows,
+      // The radar's own number. Was the literal string '0.00%' regardless of
+      // reality; now it is the share of the last 6h of traces that carry a
+      // flagged hallucination row.
+      halluc_rate:  total6h > 0 ? `${(hall6h / total6h * 100).toFixed(2)}%` : '0.00%',
+      halluc_count: hall6h,
+      hallucinations: hallR.rows.map(h => ({
+        id:       h.id,
+        agent:    h.agent,
+        score:    parseFloat(h.confidence),
+        pct:      Math.round(parseFloat(h.confidence) * 100),
+        excerpt:  h.excerpt,
+        reviewed: h.reviewed,
+      })),
+      cost_6h:      `$${formatCost(parseFloat(costR.rows[0]?.total || 0))}`,
+      agents:       agentsR.rows.map(a => ({
+        agent:    a.agent,
+        runs:     parseInt(a.runs),
+        avg_cost: formatCost(parseFloat(a.avg_cost || 0)),
+        health:   Math.round(parseFloat(a.health || 0)),
+      })),
+      volume:  bucketR.rows.map(r => ({ t: r.t, traces: r.traces, flags: r.flags })),
+      latency: bucketR.rows.map(r => ({ t: r.t, p50: r.p50_ms / 1000, p95: r.p95_ms / 1000 })),
     });
   } catch (e) {
+    console.error('Observe dashboard error:', e.message);
     err(res, 'Dashboard error', 500);
   }
 });

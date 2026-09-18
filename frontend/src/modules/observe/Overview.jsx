@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { useWebSocket } from '../../hooks/useApi'
+import { useWebSocket, useData } from '../../hooks/useApi'
 import { StatCard, Panel, EmptyState, Button } from '../../components/ui/index'
 import { clsx } from 'clsx'
 import {
@@ -8,53 +8,102 @@ import {
 } from 'recharts'
 
 // ── CUSTOM TOOLTIP ───────────────────────────────────────────────
+// The latency chart plots seconds and the volume chart plots counts, so the
+// unit is decided per series name rather than assumed.
 function ChartTip({ active, payload, label }) {
   if (!active || !payload?.length) return null
+  const isLatency = payload.some(p => p.name === 'p50' || p.name === 'p95')
   return (
     <div style={{ background: 'var(--base2)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 12px', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
       <div style={{ color: 'var(--text3)', marginBottom: 4 }}>{label}</div>
       {payload.map(p => (
         <div key={p.name} style={{ color: p.color, display: 'flex', gap: 8, justifyContent: 'space-between' }}>
-          <span>{p.name}</span><span style={{ fontWeight: 600 }}>{p.value}</span>
+          <span>{p.name}</span>
+          <span style={{ fontWeight: 600 }}>
+            {isLatency ? `${Number(p.value).toFixed(2)}s` : p.value}
+          </span>
         </div>
       ))}
     </div>
   )
 }
 
+// ── FORMATTERS ───────────────────────────────────────────────────
+// The API already formats cost and duration; these are the fallbacks for a
+// trace that arrived over the WebSocket before its row was re-fetched.
+const money = (v) => {
+  const n = Number(v) || 0
+  if (n === 0) return '$0.00'
+  if (Math.abs(n) < 0.01) return `$${n.toFixed(4)}`
+  return `$${n.toFixed(2)}`
+}
+
+function fmtDuration(ms) {
+  const n = Number(ms) || 0
+  if (n < 1000)  return `${Math.round(n)}ms`
+  if (n < 60000) return `${(n / 1000).toFixed(1)}s`
+  const m = Math.floor(n / 60000)
+  return `${m}m ${Math.round((n % 60000) / 1000)}s`
+}
+
+// One normaliser for both sources. A fetched row carries cost/duration strings;
+// a WebSocket frame carries only cost_usd/duration_ms. Same shape out.
+function normTrace(t) {
+  return {
+    ...t,
+    cost:     t.cost     !== undefined ? t.cost     : money(t.cost_usd),
+    duration: t.duration !== undefined ? t.duration : fmtDuration(t.duration_ms),
+    flags:    Array.isArray(t.flags) ? t.flags.filter(Boolean) : [],
+    steps:    Array.isArray(t.steps) ? t.steps : [],
+  }
+}
+
+const FLAG_CHIP = { halluc: ['⚡ halluc', 'chip-purple'], loop: ['⟳ loop', 'chip-red'], drift: ['∿ drift', 'chip-orange'] }
+
+function statusMeta(status) {
+  if (status === 'error')   return { color: 'var(--red)',    label: '✕ error',   cls: 'chip-red' }
+  if (status === 'warning') return { color: 'var(--orange)', label: '⚠ warning', cls: 'chip-orange' }
+  return { color: 'var(--green)', label: '✓ success', cls: 'chip-green' }
+}
+
 // ── TRACE ROW ────────────────────────────────────────────────────
 function TraceRow({ trace, onClick }) {
-  const statusColor = trace.status === 'error' ? 'var(--red)' : trace.status === 'warning' ? 'var(--orange)' : 'var(--green)'
-  const flags = trace.flags || []
+  const t = normTrace(trace)
+  const st = statusMeta(t.status)
+  const flagged = t.flags.includes('loop') || t.status === 'error'
+
+  // Show the real flagged reasons when there are any; otherwise the status is
+  // the only true chip. A green "clean" chip on an unlogged row would be a claim.
+  const chips = t.flags.length
+    ? t.flags.map(f => ({ label: (FLAG_CHIP[f] || [f, 'chip-green'])[0], cls: (FLAG_CHIP[f] || [f, 'chip-green'])[1] }))
+    : [{ label: st.label, cls: st.cls }]
 
   return (
-    <div onClick={() => onClick(trace)}
+    <div onClick={() => onClick(t)}
       style={{
         display: 'grid', gridTemplateColumns: '8px 1fr auto auto auto',
         alignItems: 'center', gap: 12,
         padding: '10px 14px',
-        background: flags.includes('error') || flags.includes('loop') ? 'rgba(255,77,109,0.03)' : 'var(--base2)',
-        border: `1px solid ${flags.includes('error') || flags.includes('loop') ? 'rgba(255,77,109,0.25)' : 'var(--border)'}`,
+        background: flagged ? 'rgba(255,77,109,0.03)' : 'var(--base2)',
+        border: `1px solid ${flagged ? 'rgba(255,77,109,0.25)' : 'var(--border)'}`,
         borderRadius: 8, cursor: 'pointer', transition: 'all var(--t-fast)',
         marginBottom: 5,
       }}
       onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--acid-glow)'}
-      onMouseLeave={e => e.currentTarget.style.borderColor = flags.includes('error') ? 'rgba(255,77,109,0.25)' : 'var(--border)'}
+      onMouseLeave={e => e.currentTarget.style.borderColor = flagged ? 'rgba(255,77,109,0.25)' : 'var(--border)'}
     >
-      <div style={{ width: 8, height: 8, borderRadius: '50%', background: statusColor, boxShadow: `0 0 6px ${statusColor}`, flexShrink: 0 }} />
+      <div style={{ width: 8, height: 8, borderRadius: '50%', background: st.color, boxShadow: `0 0 6px ${st.color}`, flexShrink: 0 }} />
       <div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', fontFamily: 'var(--font-mono)' }}>{trace.agent} · <span style={{ color: 'var(--text3)' }}>#{trace.id?.slice(-8)}</span></div>
-        <div style={{ fontSize: 10, color: 'var(--text3)', marginTop: 2 }}>{trace.task} · {trace.model}</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', fontFamily: 'var(--font-mono)' }}>{t.agent} · <span style={{ color: 'var(--text3)' }}>#{t.id?.slice(-8)}</span></div>
+        <div style={{ fontSize: 10, color: 'var(--text3)', marginTop: 2 }}>{t.task} · {t.model}</div>
       </div>
       <div style={{ display: 'flex', gap: 4 }}>
-        {flags.map(f => (
-          <span key={f} className={clsx('chip', f === 'halluc' ? 'chip-purple' : f === 'loop' ? 'chip-red' : f === 'drift' ? 'chip-orange' : 'chip-green')} style={{ fontSize: 9 }}>
-            {f === 'halluc' ? '⚡ halluc' : f === 'loop' ? '⟳ loop' : f === 'drift' ? '∿ drift' : '✓ clean'}
-          </span>
+        {chips.map((c, i) => (
+          <span key={`${c.label}-${i}`} className={clsx('chip', c.cls)} style={{ fontSize: 9 }}>{c.label}</span>
         ))}
       </div>
-      <div style={{ fontSize: 10, color: 'var(--text2)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>{trace.duration}</div>
-      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--acid)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', textAlign: 'right' }}>${trace.cost}</div>
+      <div style={{ fontSize: 10, color: 'var(--text2)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>{t.duration}</div>
+      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--acid)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', textAlign: 'right' }}>{t.cost}</div>
     </div>
   )
 }
@@ -62,7 +111,14 @@ function TraceRow({ trace, onClick }) {
 // ── TRACE INSPECTOR MODAL ────────────────────────────────────────
 function TraceModal({ trace, onClose }) {
   if (!trace) return null
-  const steps = trace.steps || []
+  const t = normTrace(trace)
+  const steps = t.steps
+
+  // The old modal read trace.tool_calls / trace.llm_steps — fields the API has
+  // never returned, so both counters always rendered 0. Count them from the
+  // real decision chain instead.
+  const toolCalls = steps.filter(s => s.type === 'tool').length
+  const llmSteps  = steps.filter(s => s.type === 'think').length
 
   return (
     <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}>
@@ -70,17 +126,17 @@ function TraceModal({ trace, onClose }) {
         <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
           <div>
             <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 16, marginBottom: 4 }}>Trace Inspector</div>
-            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>{trace.agent} · #{trace.id?.slice(-8)} · {trace.model}</div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>{t.agent} · #{t.id?.slice(-8)} · {t.model}</div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', fontSize: 18, lineHeight: 1, padding: 4 }}>✕</button>
         </div>
         <div style={{ padding: '18px 22px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginBottom: 18 }}>
             {[
-              { k: 'Duration', v: trace.duration, c: 'var(--red)' },
-              { k: 'Cost', v: `$${trace.cost}`, c: 'var(--acid)' },
-              { k: 'Tool Calls', v: trace.tool_calls || 0, c: 'var(--text)' },
-              { k: 'LLM Steps', v: trace.llm_steps || 0, c: 'var(--text)' },
+              { k: 'Duration',  v: t.duration,   c: 'var(--red)' },
+              { k: 'Cost',      v: t.cost,       c: 'var(--acid)' },
+              { k: 'Tool Calls',v: toolCalls,    c: 'var(--text)' },
+              { k: 'LLM Steps', v: llmSteps,     c: 'var(--text)' },
             ].map(m => (
               <div key={m.k} style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px' }}>
                 <div style={{ fontSize: 9, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: 'var(--font-mono)', marginBottom: 4 }}>{m.k}</div>
@@ -89,90 +145,61 @@ function TraceModal({ trace, onClose }) {
             ))}
           </div>
 
-          {trace.diagnosis && (
-            <div style={{ background: 'rgba(255,77,109,0.06)', border: '1px solid rgba(255,77,109,0.2)', borderRadius: 8, padding: '12px 14px', marginBottom: 16, fontSize: 11, color: 'var(--text2)', lineHeight: 1.7, fontFamily: 'var(--font-mono)' }}>
-              <span style={{ color: 'var(--red)', fontWeight: 700 }}>Root Cause: </span>{trace.diagnosis.root_cause}<br/>
-              <span style={{ color: 'var(--acid)', fontWeight: 700 }}>Fix: </span>{trace.diagnosis.fix}
+          <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: 'var(--font-mono)', marginBottom: 10 }}>Decision Chain</div>
+          {steps.length === 0 ? (
+            <EmptyState icon="◇" title="No decision chain recorded"
+              desc="This trace was logged without steps. Pass a steps array to ta.observe.trace() to see it here." />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+              {steps.map((step, i) => {
+                const nodeColors = { think: 'var(--blue)', tool: 'var(--acid)', flag: 'var(--red)', result: 'var(--green)', warn: 'var(--orange)' }
+                const c = nodeColors[step.type] || 'var(--text3)'
+                return (
+                  <div key={i} style={{ display: 'flex', gap: 10, position: 'relative', paddingBottom: 2 }}>
+                    {i < steps.length - 1 && <div style={{ position: 'absolute', left: 15, top: 30, bottom: -2, width: 1, background: 'linear-gradient(to bottom, var(--border2), transparent)' }} />}
+                    <div style={{ width: 30, height: 30, borderRadius: '50%', border: `1.5px solid ${c}`, background: `${c}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, flexShrink: 0, zIndex: 1 }}>
+                      {step.type === 'think' ? '🧠' : step.type === 'tool' ? '🔧' : step.type === 'flag' ? '⚡' : step.type === 'result' ? '✓' : '⚠'}
+                    </div>
+                    <div style={{ flex: 1, paddingBottom: 16 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: step.type === 'flag' ? 'var(--red)' : 'var(--text)', marginBottom: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontFamily: 'var(--font-mono)' }}>
+                        <span>{step.label}</span>
+                        <span style={{ fontSize: 9, color: 'var(--text3)' }}>{step.ts}</span>
+                      </div>
+                      {step.detail && <div style={{ fontSize: 10, color: 'var(--text2)', lineHeight: 1.55 }}>{step.detail}</div>}
+                      {step.code && <div style={{ fontSize: 9, background: 'var(--base3)', border: '1px solid var(--border)', borderRadius: 5, padding: '5px 8px', marginTop: 5, color: 'var(--acid)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{step.code}</div>}
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           )}
-
-          <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: 'var(--font-mono)', marginBottom: 10 }}>Decision Chain</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-            {steps.map((step, i) => {
-              const nodeColors = { think: 'var(--blue)', tool: 'var(--acid)', flag: 'var(--red)', result: 'var(--green)', warn: 'var(--orange)' }
-              const c = nodeColors[step.type] || 'var(--text3)'
-              return (
-                <div key={i} style={{ display: 'flex', gap: 10, position: 'relative', paddingBottom: 2 }}>
-                  {i < steps.length - 1 && <div style={{ position: 'absolute', left: 15, top: 30, bottom: -2, width: 1, background: 'linear-gradient(to bottom, var(--border2), transparent)' }} />}
-                  <div style={{ width: 30, height: 30, borderRadius: '50%', border: `1.5px solid ${c}`, background: `${c}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, flexShrink: 0, zIndex: 1 }}>
-                    {step.type === 'think' ? '🧠' : step.type === 'tool' ? '🔧' : step.type === 'flag' ? '⚡' : step.type === 'result' ? '✓' : '⚠'}
-                  </div>
-                  <div style={{ flex: 1, paddingBottom: 16 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: step.type === 'flag' ? 'var(--red)' : 'var(--text)', marginBottom: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontFamily: 'var(--font-mono)' }}>
-                      <span>{step.label}</span>
-                      <span style={{ fontSize: 9, color: 'var(--text3)' }}>{step.ts}</span>
-                    </div>
-                    {step.detail && <div style={{ fontSize: 10, color: 'var(--text2)', lineHeight: 1.55 }}>{step.detail}</div>}
-                    {step.code && <div style={{ fontSize: 9, background: 'var(--base3)', border: '1px solid var(--border)', borderRadius: 5, padding: '5px 8px', marginTop: 5, color: 'var(--acid)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{step.code}</div>}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
         </div>
       </div>
     </div>
   )
 }
 
-// ── MOCK DATA ────────────────────────────────────────────────────
-const MOCK_TRACES = [
-  { id: 'tr_9a2f1234', agent: 'research-agent', task: 'market_research', model: 'claude-3-5-sonnet', status: 'error', flags: ['loop', 'cost'], duration: '4m 12s', cost: '0.121', tool_calls: 38, llm_steps: 14,
-    diagnosis: { root_cause: 'Agent called web_search 6× with identical query — stuck in reasoning loop without reformulation.', fix: 'Add max_consecutive_tool_calls=3 to SDK config. Add "reformulate on no new info" system prompt instruction.' },
-    steps: [
-      { type: 'think', label: 'System Prompt Received', ts: '+0ms', detail: 'Task: Research top 5 AI competitors and pricing' },
-      { type: 'tool',  label: 'web_search #1', ts: '+412ms', code: 'query: "AI competitor pricing 2024"' },
-      { type: 'think', label: 'LLM Reasoning', ts: '+3.2s', detail: 'Results too general. Needs specific pricing data.' },
-      { type: 'tool',  label: 'web_search #2 — IDENTICAL', ts: '+3.5s', code: 'query: "AI competitor pricing 2024"', detail: '⚠ Same query — REPEAT #2 of 6' },
-      { type: 'flag',  label: 'Loop Detected', ts: '+72s', detail: '6× identical tool calls. Agent stuck. Slack alert sent.' },
-      { type: 'warn',  label: 'Still Running…', ts: '+252s', detail: '$0.12 and counting. Circuit breaker needed.' },
-    ]
-  },
-  { id: 'tr_7b1e5678', agent: 'research-agent', task: 'competitor_analysis', model: 'claude-3-5-sonnet', status: 'warning', flags: ['halluc'], duration: '12.3s', cost: '0.021' },
-  { id: 'tr_4c9d9abc', agent: 'support-agent', task: 'resolve_ticket_8841', model: 'claude-3-5-haiku', status: 'success', flags: ['clean'], duration: '2.3s', cost: '0.004' },
-  { id: 'tr_2a7cdef0', agent: 'email-drafter', task: 'outreach_batch_447', model: 'gpt-4o-mini', status: 'success', flags: ['clean'], duration: '18.4s', cost: '0.031' },
-  { id: 'tr_1f5a1111', agent: 'research-agent', task: 'news_monitor', model: 'claude-3-5-sonnet', status: 'warning', flags: ['drift', 'halluc'], duration: '8.7s', cost: '0.019' },
-  { id: 'tr_0e8b2222', agent: 'support-agent', task: 'resolve_ticket_8840', model: 'claude-3-5-haiku', status: 'success', flags: ['clean'], duration: '1.9s', cost: '0.003' },
-]
-
-const MOCK_VOLUME = [
-  { t: '18:00', traces: 210, flags: 2 }, { t: '18:30', traces: 245, flags: 3 },
-  { t: '19:00', traces: 290, flags: 1 }, { t: '19:30', traces: 318, flags: 5 },
-  { t: '20:00', traces: 280, flags: 2 }, { t: '20:30', traces: 305, flags: 4 },
-  { t: '21:00', traces: 412, flags: 11},{ t: '21:30', traces: 388, flags: 8 },
-  { t: '22:00', traces: 340, flags: 3 }, { t: '22:30', traces: 295, flags: 2 },
-  { t: '23:00', traces: 271, flags: 1 }, { t: '23:30', traces: 287, flags: 3 },
-]
-
-const MOCK_LATENCY = [
-  { t: '18:00', p50: 1.2, p95: 4.1 }, { t: '18:30', p50: 1.4, p95: 5.2 },
-  { t: '19:00', p50: 1.8, p95: 6.8 }, { t: '19:30', p50: 2.1, p95: 8.4 },
-  { t: '20:00', p50: 1.9, p95: 7.1 }, { t: '20:30', p50: 2.3, p95: 9.2 },
-  { t: '21:00', p50: 3.1, p95: 14.2},{ t: '21:30', p50: 2.8, p95: 11.8},
-  { t: '22:00', p50: 2.1, p95: 8.3 }, { t: '22:30', p50: 1.7, p95: 6.4 },
-  { t: '23:00', p50: 1.5, p95: 5.1 }, { t: '23:30', p50: 1.6, p95: 5.8 },
-]
-
 // ── OVERVIEW PAGE ────────────────────────────────────────────────
 export default function ObserveOverview({ onEventRate }) {
-  const [traces, setTraces]       = useState(MOCK_TRACES)
-  const [selected, setSelected]   = useState(null)
+  const [traces, setTraces]     = useState([])
+  const [selected, setSelected] = useState(null)
   const [liveCount, setLiveCount] = useState(0)
 
-  // WebSocket for live traces
+  const { data, loading, error, refetch } = useData('/v1/observe/traces?limit=50')
+  const { data: dashData, error: dashError, refetch: refetchDash } = useData('/v1/observe/dashboard')
+
+  // History from the API. Empty until the fetch lands — never seeded with mocks.
+  useEffect(() => {
+    if (!data?.traces) return
+    setTraces(data.traces.map(normTrace))
+  }, [data])
+
+  // Live WebSocket frames merge into the same list, de-duplicated by id so a
+  // trace that arrives twice (once live, once on refetch) shows once.
   const { connected } = useWebSocket('/traces', useCallback((msg) => {
-    if (msg.type === 'trace') {
-      setTraces(prev => [msg.data, ...prev].slice(0, 50))
+    if (msg.type === 'trace' && msg.data) {
+      const incoming = normTrace(msg.data)
+      setTraces(prev => [incoming, ...prev.filter(t => t.id !== incoming.id)].slice(0, 100))
       setLiveCount(c => c + 1)
     }
   }, []))
@@ -186,35 +213,69 @@ export default function ObserveOverview({ onEventRate }) {
     return () => clearInterval(interval)
   }, [liveCount, onEventRate])
 
-  const stats = {
-    total:   traces.length,
-    success: traces.filter(t => t.status === 'success').length,
-    flags:   traces.filter(t => t.flags?.some(f => f !== 'clean')).length,
-    avgCost: (traces.reduce((s, t) => s + parseFloat(t.cost || 0), 0) / traces.length).toFixed(4),
+  const dash   = dashData || {}
+  const agents = dash.agents || []
+  const volume = dash.volume || []
+  const latency = dash.latency || []
+  const hals   = dash.hallucinations || []
+
+  // Traces / 6h comes from the dashboard aggregate over the real 6h window —
+  // the length of the 50-row page is not that number.
+  const total6h = Number(dash.traces_6h) || 0
+  const prev6h  = Number(dash.traces_prev_6h) || 0
+  const delta   = prev6h > 0
+    ? `${((total6h - prev6h) / prev6h * 100).toFixed(1)}% vs prev 6h`
+    : (total6h > 0 ? 'no prior 6h window' : null)
+
+  const successRate = dash.success_rate || (total6h > 0 ? '—' : '—')
+  const flagRate    = dash.success_rate ? `${(100 - parseFloat(dash.success_rate)).toFixed(2)}%` : '—'
+
+  // Only a real flagged trace raises the banner, and it names that trace.
+  const looped = traces.find(t => t.flags.includes('loop'))
+
+  if (loading) {
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text3)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+      Loading traces…
+    </div>
+  }
+  if (error) {
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--red)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+      Could not load traces: {error}
+      <div style={{ marginTop: 12 }}><Button variant="ghost" size="sm" onClick={refetch}>Retry</Button></div>
+    </div>
   }
 
   return (
     <div style={{ padding: 24 }}>
 
-      {/* Alert */}
-      {traces.some(t => t.flags?.includes('loop')) && (
+      {/* Alert — derived from a real flagged trace, not a hardcoded story */}
+      {looped && (
         <div style={{ background: 'var(--red-dim)', border: '1px solid rgba(255,77,109,0.3)', borderRadius: 10, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, animation: 'fadeUp 0.4s ease' }}>
           <span style={{ fontSize: 16 }}>⚡</span>
           <div style={{ flex: 1 }}>
-            <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 13, color: 'var(--red)' }}>Tool Loop Detected — research-agent</div>
-            <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>6× identical web_search calls · trace #tr_9a2f · $0.12 and counting</div>
+            <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 13, color: 'var(--red)' }}>Tool Loop Flagged — {looped.agent}</div>
+            <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>
+              {looped.task} · trace #{looped.id?.slice(-8)} · {looped.cost} recorded
+            </div>
           </div>
-          <Button variant="danger" size="sm" onClick={() => setSelected(traces[0])}>Inspect →</Button>
+          <Button variant="danger" size="sm" onClick={() => setSelected(looped)}>Inspect →</Button>
+        </div>
+      )}
+
+      {dashError && (
+        <div style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 10, padding: '10px 14px', marginBottom: 20, fontSize: 11, color: 'var(--text2)', fontFamily: 'var(--font-mono)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span>⚠</span><span style={{ flex: 1 }}>Summary metrics unavailable: {dashError}</span>
+          <Button variant="ghost" size="sm" onClick={refetchDash}>Retry</Button>
         </div>
       )}
 
       {/* KPIs */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 20 }}>
-        <StatCard label="⟳ Traces / 6h" value={traces.length.toLocaleString()} delta="↑ 12.4% vs prev" deltaDir="up" color="var(--blue)" />
-        <StatCard label="✓ Success Rate" value={`${((stats.success/stats.total)*100).toFixed(1)}%`} delta="↓ 0.4% · 3 failures" deltaDir="down" color="var(--green)" />
-        <StatCard label="⚡ Flag Rate" value={`${((stats.flags/stats.total)*100).toFixed(2)}%`} delta="↑ +0.03% · 3 flagged" deltaDir="down" color="var(--red)" alert />
-        <StatCard label="⏱ Avg Latency" value="2.8s" delta="P95: 8.4s · P99: 22s" color="var(--text)" />
-        <StatCard label="◇ Cost / 6h" value="$4.82" delta="↑ +18% · runaway agent" deltaDir="down" color="var(--orange)" />
+        <StatCard label="⟳ Traces / 6h" value={total6h.toLocaleString()} delta={delta} deltaDir={total6h >= prev6h ? 'up' : 'down'} color="var(--blue)" />
+        <StatCard label="✓ Success Rate" value={successRate} delta={total6h > 0 ? `${total6h} traces in window` : 'no traces yet'} color="var(--green)" />
+        <StatCard label="⚡ Flag Rate" value={flagRate} delta={dash.halluc_count ? `${dash.halluc_count} flagged output${dash.halluc_count === 1 ? '' : 's'}` : null} deltaDir="down" color="var(--red)" alert={Number(parseFloat(flagRate)) > 0} />
+        <StatCard label="⏱ Avg Latency" value={dash.avg_latency || '—'} delta={latency.length ? `P95 peak: ${Math.max(...latency.map(l => l.p95)).toFixed(1)}s` : null} color="var(--text)" />
+        <StatCard label="◇ Cost / 6h" value={dash.cost_6h || '$0.00'} delta={agents.length ? `${agents.length} agent${agents.length === 1 ? '' : 's'} active` : null} color="var(--orange)" />
       </div>
 
       {/* Main grid */}
@@ -222,89 +283,109 @@ export default function ObserveOverview({ onEventRate }) {
 
         {/* Traces */}
         <Panel title="⟳ Recent Traces" subtitle="Click any trace to inspect decision chain" action="View all →">
-          <div>
-            {traces.slice(0, 6).map(t => <TraceRow key={t.id} trace={t} onClick={setSelected} />)}
-          </div>
+          {traces.length === 0 ? (
+            <EmptyState icon="⟳" title="No traces yet"
+              desc="Send your first trace with ta.observe.trace() and it appears here within seconds." />
+          ) : (
+            <div>{traces.slice(0, 6).map(t => <TraceRow key={t.id} trace={t} onClick={setSelected} />)}</div>
+          )}
         </Panel>
 
         {/* Charts */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <Panel title="◈ Trace Volume + Flags" subtitle="6h window · 30min buckets">
-            <ResponsiveContainer width="100%" height={110}>
-              <BarChart data={MOCK_VOLUME} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="t" tick={{ fontSize: 9, fill: 'var(--text3)', fontFamily: 'var(--font-mono)' }} tickLine={false} />
-                <YAxis tick={{ fontSize: 9, fill: 'var(--text3)' }} tickLine={false} />
-                <Tooltip content={<ChartTip />} />
-                <Bar dataKey="traces" fill="rgba(77,158,255,0.5)" radius={[2,2,0,0]} />
-                <Bar dataKey="flags" fill="rgba(255,77,109,0.7)" radius={[2,2,0,0]} />
-              </BarChart>
-            </ResponsiveContainer>
+            {volume.length === 0 ? (
+              <EmptyState icon="◈" title="No volume in this window"
+                desc="Buckets fill as traces arrive. Each half hour is one bar, zero-inclusive." />
+            ) : (
+              <ResponsiveContainer width="100%" height={110}>
+                <BarChart data={volume} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                  <XAxis dataKey="t" tick={{ fontSize: 9, fill: 'var(--text3)', fontFamily: 'var(--font-mono)' }} tickLine={false} />
+                  <YAxis tick={{ fontSize: 9, fill: 'var(--text3)' }} tickLine={false} allowDecimals={false} />
+                  <Tooltip content={<ChartTip />} />
+                  <Bar dataKey="traces" fill="rgba(77,158,255,0.5)" radius={[2,2,0,0]} />
+                  <Bar dataKey="flags" fill="rgba(255,77,109,0.7)" radius={[2,2,0,0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </Panel>
           <Panel title="⏱ Latency Trends" subtitle="P50 + P95 over 6h">
-            <ResponsiveContainer width="100%" height={90}>
-              <AreaChart data={MOCK_LATENCY} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="t" tick={{ fontSize: 9, fill: 'var(--text3)', fontFamily: 'var(--font-mono)' }} tickLine={false} />
-                <YAxis tick={{ fontSize: 9, fill: 'var(--text3)' }} tickLine={false} />
-                <Tooltip content={<ChartTip />} />
-                <Area type="monotone" dataKey="p50" stroke="var(--acid)" fill="rgba(232,255,71,0.06)" strokeWidth={1.5} dot={false} name="P50" />
-                <Area type="monotone" dataKey="p95" stroke="var(--orange)" fill="rgba(255,140,66,0.05)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="P95" />
-              </AreaChart>
-            </ResponsiveContainer>
+            {latency.length === 0 ? (
+              <EmptyState icon="⏱" title="No latency yet"
+                desc="Percentiles are computed from real trace durations in the last 6h." />
+            ) : (
+              <ResponsiveContainer width="100%" height={90}>
+                <AreaChart data={latency} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                  <XAxis dataKey="t" tick={{ fontSize: 9, fill: 'var(--text3)', fontFamily: 'var(--font-mono)' }} tickLine={false} />
+                  <YAxis tick={{ fontSize: 9, fill: 'var(--text3)' }} tickLine={false} />
+                  <Tooltip content={<ChartTip />} />
+                  <Area type="monotone" dataKey="p50" stroke="var(--acid)" fill="rgba(232,255,71,0.06)" strokeWidth={1.5} dot={false} name="P50" />
+                  <Area type="monotone" dataKey="p95" stroke="var(--orange)" fill="rgba(255,140,66,0.05)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="P95" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
           </Panel>
         </div>
 
-        {/* Agent Health */}
-        <Panel title="◈ Agent Health" subtitle="Live status" action="Configure →">
-          {[
-            { name: 'research-agent', icon: '🔍', health: 42, runs: 24, cost: '$0.041', status: 'loop',  statusColor: 'var(--red)' },
-            { name: 'support-agent',  icon: '🎧', health: 97, runs: 312, cost: '$0.004', status: 'clean', statusColor: 'var(--green)' },
-            { name: 'email-drafter',  icon: '✉️',  health: 81, runs: 47,  cost: '$0.018', status: 'drift', statusColor: 'var(--orange)' },
-          ].map(a => (
-            <div key={a.name} style={{ marginBottom: 14 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--base3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, flexShrink: 0 }}>{a.icon}</div>
-                <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600, color: 'var(--text)' }}>{a.name}</div>
-                <span className={clsx('chip', a.status === 'clean' ? 'chip-green' : a.status === 'loop' ? 'chip-red' : 'chip-orange')} style={{ fontSize: 9 }}>{a.status}</span>
-              </div>
-              <div style={{ height: 4, background: 'var(--base3)', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
-                <div style={{ height: '100%', width: `${a.health}%`, background: a.statusColor, borderRadius: 2, transition: 'width 0.6s ease' }} />
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>
-                <span>{a.health}% health</span><span>{a.runs}/hr · {a.cost}/run</span>
-              </div>
-            </div>
-          ))}
+        {/* Agent Health — real agents from the last hour, health measured */}
+        <Panel title="◈ Agent Health" subtitle="Last hour">
+          {agents.length === 0 ? (
+            <EmptyState icon="◈" title="No agents reporting"
+              desc="Agents appear here once they log a trace. Health is the share of runs that succeeded." />
+          ) : (
+            agents.slice(0, 5).map(a => {
+              const healthColor = a.health >= 90 ? 'var(--green)' : a.health >= 60 ? 'var(--orange)' : 'var(--red)'
+              const chip = a.health >= 90 ? ['clean', 'chip-green'] : a.health >= 60 ? ['degraded', 'chip-orange'] : ['failing', 'chip-red']
+              return (
+                <div key={a.agent} style={{ marginBottom: 14 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                    <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--base3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, flexShrink: 0 }}>◈</div>
+                    <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.agent}</div>
+                    <span className={clsx('chip', chip[1])} style={{ fontSize: 9 }}>{chip[0]}</span>
+                  </div>
+                  <div style={{ height: 4, background: 'var(--base3)', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
+                    <div style={{ height: '100%', width: `${a.health}%`, background: healthColor, borderRadius: 2, transition: 'width 0.6s ease' }} />
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>
+                    <span>{a.health}% health</span><span>{a.runs}/hr · ${a.avg_cost}/run</span>
+                  </div>
+                </div>
+              )
+            })
+          )}
         </Panel>
       </div>
 
       {/* Hallucination Radar */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 14 }}>
         <Panel title="⚡ Hallucination Radar" subtitle="Last 6h" action="Review all →">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {[
-              { agent: 'research-agent · tr_7b1e', score: 0.87, excerpt: '"Acme Corp reported $42M ARR in Q3" — no source found in tool results. Model confabulated.', pct: 87 },
-              { agent: 'research-agent · tr_1f5a', score: 0.73, excerpt: '"CompetitorX pricing starts at $299/mo" — tool call returned no pricing data for this claim.', pct: 73 },
-              { agent: 'email-drafter · tr_3d2c',  score: 0.61, excerpt: '"As per our 30-day money-back guarantee…" — no such policy in RAG context.', pct: 61 },
-            ].map((h, i) => (
-              <div key={i} style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 11px', cursor: 'pointer' }}
-                onMouseEnter={e => e.currentTarget.style.borderColor = 'rgba(180,122,255,0.4)'}
-                onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--purple)', fontFamily: 'var(--font-mono)' }}>{h.agent}</span>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--red)', fontFamily: 'var(--font-mono)' }}>{h.score}</span>
+          {hals.length === 0 ? (
+            <EmptyState icon="⚡" title="No flagged outputs"
+              desc="Nothing has been flagged as a hallucination in the last 6h. Flagged outputs are recorded against the trace they came from." />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {hals.map(h => (
+                <div key={h.id} style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 11px', cursor: 'pointer' }}
+                  onMouseEnter={e => e.currentTarget.style.borderColor = 'rgba(180,122,255,0.4)'}
+                  onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--purple)', fontFamily: 'var(--font-mono)' }}>{h.agent}</span>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--red)', fontFamily: 'var(--font-mono)' }}>{h.score}</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--text2)', lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{h.excerpt}</div>
+                  <div style={{ marginTop: 5, height: 2, background: 'var(--border)', borderRadius: 1, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', width: `${h.pct}%`, background: 'linear-gradient(90deg, var(--red), var(--purple))' }} />
+                  </div>
                 </div>
-                <div style={{ fontSize: 10, color: 'var(--text2)', lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{h.excerpt}</div>
-                <div style={{ marginTop: 5, height: 2, background: 'var(--border)', borderRadius: 1, overflow: 'hidden' }}>
-                  <div style={{ height: '100%', width: `${h.pct}%`, background: 'linear-gradient(90deg, var(--red), var(--purple))' }} />
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </Panel>
 
+        {/* WebSocket status — shows the host actually in use, not a placeholder */}
         <Panel title="◈ WebSocket Status" subtitle={connected ? 'Live trace stream active' : 'Connecting…'}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -313,8 +394,8 @@ export default function ObserveOverview({ onEventRate }) {
                 {connected ? 'Live · receiving traces' : 'Disconnected · reconnecting…'}
               </span>
             </div>
-            <div style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text2)', lineHeight: 2 }}>
-              <div>Endpoint: <span style={{ color: 'var(--acid)' }}>wss://your-host.example.com/ws/traces</span></div>
+            <div style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text2)', lineHeight: 2, overflowWrap: 'anywhere' }}>
+              <div>Endpoint: <span style={{ color: 'var(--acid)' }}>{typeof window !== 'undefined' ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/traces` : '/ws/traces'}</span></div>
               <div>Protocol: <span style={{ color: 'var(--text)' }}>WebSocket · JSON frames</span></div>
               <div>Auth: <span style={{ color: 'var(--text)' }}>Bearer JWT in query param</span></div>
               <div>Reconnect: <span style={{ color: 'var(--green)' }}>Auto · 3s backoff</span></div>
