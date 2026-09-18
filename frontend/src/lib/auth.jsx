@@ -47,10 +47,10 @@ export function AuthProvider({ children }) {
     return d
   }
 
-  async function signup(name, email, password) {
+  async function signup(name, email, password, confirmNewOrg = false) {
     const d = await apiFetch('/auth/signup', {
       method: 'POST',
-      body: JSON.stringify({ name, email, password }),
+      body: JSON.stringify({ name, email, password, confirm_new_org: confirmNewOrg }),
     })
     if (!d) throw new Error('Signup failed')
     setToken(d.token, true)
