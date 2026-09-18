@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { StatCard, Panel, Button, EmptyState } from '../../components/ui/index'
-import { useData } from '../../hooks/useApi'
+import { StatCard, Panel, Button, EmptyState, SampleBanner, EmptyOnboardingCard, toast } from '../../components/ui/index'
+import { useData, apiFetch } from '../../hooks/useApi'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid
@@ -130,6 +130,8 @@ function ConnectKeyModal({ onClose }) {
 
 export default function SpendOverview() {
   const [showConnect, setShowConnect] = useState(false)
+  const [clearing, setClearing]       = useState(false)
+  const [reloading, setReloading]     = useState(false)
   const { data, loading, error, refetch } = useData('/v1/spend/dashboard?range=30d')
 
   if (loading) {
@@ -157,6 +159,33 @@ export default function SpendOverview() {
   const providers = dash.providers  || []
   const alerts   = dash.active_alerts || []
   const wasteItems = waste.items || []
+  const isSample = Boolean(dash.is_sample)
+
+  const handleClear = async () => {
+    setClearing(true)
+    try {
+      await apiFetch('/v1/sample-data/clear', { method: 'POST' })
+      toast('Sample data cleared', 'info')
+      await refetch()
+    } catch (e) {
+      toast('Failed to clear sample data: ' + e.message, 'error')
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  const handleReload = async () => {
+    setReloading(true)
+    try {
+      await apiFetch('/v1/sample-data/reload', { method: 'POST' })
+      toast('Sample data loaded', 'success')
+      await refetch()
+    } catch (e) {
+      toast('Failed to reload sample data: ' + e.message, 'error')
+    } finally {
+      setReloading(false)
+    }
+  }
 
   const totalTokens = Number(spend.total_tokens) || 0
   const totalSpend  = Number(spend.total_30d) || 0
@@ -174,6 +203,27 @@ export default function SpendOverview() {
 
   return (
     <div style={{ padding: 24 }}>
+
+      {/* Sample Data Banner */}
+      {isSample && (
+        <SampleBanner
+          moduleName="spend"
+          loading={clearing}
+          onClear={handleClear}
+        />
+      )}
+
+      {/* Empty State Onboarding: offers two clear paths */}
+      {!isSample && models.length === 0 && (
+        <EmptyOnboardingCard
+          title="No real spend recorded yet"
+          description="Connect a provider API key or send spend events to track costs, or reload the sample data to explore dashboard features."
+          connectLabel="+ Add Provider Key"
+          onConnect={() => setShowConnect(true)}
+          onReload={handleReload}
+          reloading={reloading}
+        />
+      )}
 
       {/* Spike / budget alerts — shown only when the API reports real ones. */}
       {alerts.length > 0 && (
@@ -206,7 +256,15 @@ export default function SpendOverview() {
         {/* Model spend */}
         <Panel title="⬡ Spend by Model" subtitle="30d · click to drill down" action="All →">
           {models.length === 0
-            ? <EmptyState icon="⬡" title="No model spend yet" desc="Send your first event with ta.spend.track()" />
+            ? <EmptyState icon="⬡" title="No model spend yet"
+                desc="Connect a provider key or track events with ta.spend.track(), or reload sample data."
+                action={
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 4 }}>
+                    <Button variant="outline" size="sm" onClick={() => setShowConnect(true)}>+ Add Provider Key</Button>
+                    <Button variant="ghost" size="sm" loading={reloading} onClick={handleReload}>Reload sample data</Button>
+                  </div>
+                }
+              />
             : <div style={{ display:'flex',flexDirection:'column',gap:5 }}>
                 {models.map(m => {
                   const pColor = PROV_COLORS[m.provider] || 'var(--text3)'

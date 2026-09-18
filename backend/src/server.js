@@ -173,9 +173,44 @@ function resolveSecrets() {
 const { jwtSecret: JWT_SECRET, encSecret: ENC_SECRET } = resolveSecrets();
 
 
+const { hasRealData, hasSampleData, isSampleCleared, seedSampleData, clearSampleData } = require('./sampleData');
+
 // ── DATABASE ──────────────────────────────────────────────────────
 const pool = new Pool({ connectionString: DB_URL, max: 20 });
 const db   = (text, params) => pool.query(text, params);
+
+async function initDb() {
+  try {
+    await db(`
+      ALTER TABLE orgs ADD COLUMN IF NOT EXISTS sample_cleared BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE traces ADD COLUMN IF NOT EXISTS is_sample BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE spend_events ADD COLUMN IF NOT EXISTS is_sample BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE hallucinations ADD COLUMN IF NOT EXISTS is_sample BOOLEAN NOT NULL DEFAULT FALSE;
+      CREATE INDEX IF NOT EXISTS idx_traces_sample ON traces(org_id, is_sample);
+      CREATE INDEX IF NOT EXISTS idx_spend_sample ON spend_events(org_id, is_sample);
+      CREATE INDEX IF NOT EXISTS idx_halluc_sample ON hallucinations(org_id, is_sample);
+    `);
+  } catch (e) {
+    console.error('[db] Error initializing schema:', e.message);
+  }
+}
+initDb();
+
+async function resolveDataScope(orgId) {
+  const hasReal = await hasRealData(db, orgId);
+  if (hasReal) {
+    return { isSample: false, showData: true };
+  }
+  const cleared = await isSampleCleared(db, orgId);
+  if (cleared) {
+    return { isSample: false, showData: false };
+  }
+  const hasSample = await hasSampleData(db, orgId);
+  if (!hasSample) {
+    await seedSampleData(db, orgId);
+  }
+  return { isSample: true, showData: true };
+}
 
 // ── ENCRYPTION ───────────────────────────────────────────────────
 const ENC_KEY = crypto.scryptSync(ENC_SECRET, 'toolsagent_salt', 32);
@@ -373,6 +408,9 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
 
     await db('COMMIT');
 
+    // Seed realistic sample data so the fresh dashboard is never empty
+    await seedSampleData(db, orgId).catch(e => console.error('Sample data seed error on signup:', e.message));
+
     const token = jwt.sign({ orgId, userId, email: normEmail, name: name.trim() }, JWT_SECRET, { expiresIn: '30d' });
     ok(res, { token, user: { id: userId, name: name.trim(), email: normEmail, plan: 'free' }, api_key: raw }, 201);
   } catch (e) {
@@ -425,10 +463,14 @@ app.post('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) 
   if (!task)  return err(res, 'task is required');
 
   try {
+    // A real trace has arrived — immediately purge any sample data for this org
+    // so sample data never appears in a real org's numbers after real data exists.
+    await clearSampleData(db, req.org.id).catch(() => {});
+
     const id = uuid();
     await db(
-      `INSERT INTO traces (id, org_id, agent, task, model, status, duration_ms, cost_usd, input_tokens, output_tokens, flags, steps, metadata)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO traces (id, org_id, agent, task, model, status, duration_ms, cost_usd, input_tokens, output_tokens, flags, steps, metadata, is_sample)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,false)`,
       [id, req.org.id, agent, task, model||'unknown', status||'success',
        Math.max(0,parseInt(duration_ms)||0), Math.max(0,parseFloat(cost_usd)||0),
        Math.max(0,parseInt(input_tokens)||0), Math.max(0,parseInt(output_tokens)||0),
@@ -447,23 +489,31 @@ app.post('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) 
 app.get('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) => {
   const { limit = 50, offset = 0, agent, status } = req.query;
   try {
+    const { isSample, showData } = await resolveDataScope(req.org.id);
+    if (!showData) {
+      return ok(res, { traces: [], is_sample: false });
+    }
+
     // steps + cost + duration come back formatted so the UI never has to guess
     // the display rule. Day 8 moves steps behind a single-trace detail endpoint;
     // at 50 rows of small JSON it is cheap enough to inline today.
     let q = `SELECT id, agent, task, model, status, duration_ms, cost_usd, flags, steps, started_at
-             FROM traces WHERE org_id = $1`;
-    const params = [req.org.id];
+             FROM traces WHERE org_id = $1 AND is_sample = $2`;
+    const params = [req.org.id, isSample];
     if (agent)  { params.push(agent);  q += ` AND agent = $${params.length}`; }
     if (status) { params.push(status); q += ` AND status = $${params.length}`; }
     q += ` ORDER BY started_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
     params.push(Math.min(parseInt(limit)||50, 200), Math.max(parseInt(offset)||0, 0));
     const { rows } = await db(q, params);
-    ok(res, { traces: rows.map(t => ({
-      ...t,
-      cost:     formatCost(parseFloat(t.cost_usd)),
-      duration: formatDuration(t.duration_ms),
-      steps:    Array.isArray(t.steps) ? t.steps : [],
-    })) });
+    ok(res, {
+      traces: rows.map(t => ({
+        ...t,
+        cost:     formatCost(parseFloat(t.cost_usd)),
+        duration: formatDuration(t.duration_ms),
+        steps:    Array.isArray(t.steps) ? t.steps : [],
+      })),
+      is_sample: isSample,
+    });
   } catch (e) {
     err(res, 'Failed to fetch traces', 500);
   }
@@ -472,19 +522,33 @@ app.get('/api/v1/observe/traces', apiLimiter, requireAnyAuth, async (req, res) =
 app.get('/api/v1/observe/dashboard', apiLimiter, requireAnyAuth, async (req, res) => {
   try {
     const orgId = req.org.id;
+    const { isSample, showData } = await resolveDataScope(orgId);
+    if (!showData) {
+      return ok(res, {
+        traces_6h: 0,
+        traces_prev_6h: 0,
+        avg_latency: '—',
+        success_rate: '—',
+        halluc_rate: '0.00%',
+        halluc_count: 0,
+        hallucinations: [],
+        cost_6h: '$0.00',
+        agents: [],
+        volume: [],
+        latency: [],
+        is_sample: false,
+      });
+    }
+
     const [totalR, flagsR, costR, agentsR, prevR, bucketR, hallR] = await Promise.all([
-      db(`SELECT COUNT(*) as total, AVG(duration_ms) as avg_lat FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h'`, [orgId]),
-      db(`SELECT COUNT(*) as flags FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h' AND status != 'success'`, [orgId]),
-      db(`SELECT COALESCE(SUM(cost_usd),0) as total FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '6h'`, [orgId]),
-      db(`SELECT agent, COUNT(*) as runs, AVG(cost_usd) as avg_cost, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/COUNT(*) as health FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '1h' GROUP BY agent`, [orgId]),
+      db(`SELECT COUNT(*) as total, AVG(duration_ms) as avg_lat FROM traces WHERE org_id=$1 AND is_sample=$2 AND started_at > NOW()-INTERVAL '6h'`, [orgId, isSample]),
+      db(`SELECT COUNT(*) as flags FROM traces WHERE org_id=$1 AND is_sample=$2 AND started_at > NOW()-INTERVAL '6h' AND status != 'success'`, [orgId, isSample]),
+      db(`SELECT COALESCE(SUM(cost_usd),0) as total FROM traces WHERE org_id=$1 AND is_sample=$2 AND started_at > NOW()-INTERVAL '6h'`, [orgId, isSample]),
+      db(`SELECT agent, COUNT(*) as runs, AVG(cost_usd) as avg_cost, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/COUNT(*) as health FROM traces WHERE org_id=$1 AND is_sample=$2 AND started_at > NOW()-INTERVAL '1h' GROUP BY agent`, [orgId, isSample]),
       // Previous 6h window, so the KPI deltas are measured rather than invented.
-      db(`SELECT COUNT(*) as total FROM traces WHERE org_id=$1 AND started_at > NOW()-INTERVAL '12h' AND started_at <= NOW()-INTERVAL '6h'`, [orgId]),
+      db(`SELECT COUNT(*) as total FROM traces WHERE org_id=$1 AND is_sample=$2 AND started_at > NOW()-INTERVAL '12h' AND started_at <= NOW()-INTERVAL '6h'`, [orgId, isSample]),
       // Real 30-minute buckets over the last 6h. generate_series LEFT JOINed to
       // traces so a quiet half hour shows as 0 instead of the axis shifting.
-      // The series ENDS at the bucket containing NOW(), not at the top of the
-      // hour: ending on the hour drops the current half hour, so a trace logged
-      // two minutes ago would not appear on its own chart until the next
-      // half-hour tick. That exact off-by-one-bucket was caught in verification.
       db(`WITH b AS (
             SELECT generate_series(
                      DATE_TRUNC('hour', NOW())
@@ -501,15 +565,15 @@ app.get('/api/v1/observe/dashboard', apiLimiter, requireAnyAuth, async (req, res
                  COALESCE(ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.duration_ms)), 0)::int AS p95_ms
           FROM b
           LEFT JOIN traces t ON t.org_id = $1
+               AND t.is_sample = $2
                AND t.started_at >= b.bucket
                AND t.started_at <  b.bucket + INTERVAL '30 minutes'
-          GROUP BY b.bucket ORDER BY b.bucket`, [orgId]),
-      // Hallucination radar reads the real table. The write path lands on Day 10,
-      // so today this is honestly empty rather than three invented rows.
+          GROUP BY b.bucket ORDER BY b.bucket`, [orgId, isSample]),
+      // Hallucination radar reads the real table.
       db(`SELECT h.id, h.agent, h.confidence, h.excerpt, h.reviewed, h.created_at
           FROM hallucinations h
-          WHERE h.org_id=$1 AND h.created_at > NOW()-INTERVAL '6h'
-          ORDER BY h.confidence DESC LIMIT 3`, [orgId]),
+          WHERE h.org_id=$1 AND h.is_sample=$2 AND h.created_at > NOW()-INTERVAL '6h'
+          ORDER BY h.confidence DESC LIMIT 3`, [orgId, isSample]),
     ]);
 
     const total6h  = parseInt(totalR.rows[0]?.total || 0);
@@ -545,6 +609,7 @@ app.get('/api/v1/observe/dashboard', apiLimiter, requireAnyAuth, async (req, res
       })),
       volume:  bucketR.rows.map(r => ({ t: r.t, traces: r.traces, flags: r.flags })),
       latency: bucketR.rows.map(r => ({ t: r.t, p50: r.p50_ms / 1000, p95: r.p95_ms / 1000 })),
+      is_sample: isSample,
     });
   } catch (e) {
     console.error('Observe dashboard error:', e.message);
@@ -563,9 +628,12 @@ app.post('/api/v1/spend/events', apiLimiter, requireAnyAuth, async (req, res) =>
   if (!VALID.has(String(provider).toLowerCase())) return err(res, 'Invalid provider');
 
   try {
+    // Real spend event arrived — purge sample data for this org immediately
+    await clearSampleData(db, req.org.id).catch(() => {});
+
     await db(
-      `INSERT INTO spend_events (id, org_id, provider, model, feature, input_tokens, output_tokens, cost_usd, success, metadata)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      `INSERT INTO spend_events (id, org_id, provider, model, feature, input_tokens, output_tokens, cost_usd, success, metadata, is_sample)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
       [uuid(), req.org.id, provider, model, feature,
        Math.max(0, parseInt(input_tokens)||0), Math.max(0, parseInt(output_tokens)||0),
        Math.max(0, parseFloat(cost_usd)||0), success !== false,
@@ -583,20 +651,61 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
 
   try {
     const orgId = req.org.id;
+    const { isSample, showData } = await resolveDataScope(orgId);
+    if (!showData) {
+      return ok(res, {
+        spend: {
+          total_30d: '0.00',
+          total_calls: '0',
+          total_tokens: '0',
+          avg_tokens_per_day: 0,
+          mtd_change_pct: '—',
+        },
+        by_provider: [],
+        by_feature: [],
+        by_model: [],
+        waste: {
+          retry_count: '0',
+          retry_cost: '0.00',
+          total_waste_cost: '0.00',
+          waste_pct: '0',
+          items: [],
+        },
+        projection: {
+          mtd_spend: '0.00',
+          daily_burn: '0.00',
+          projected_total: '0.00',
+          days_elapsed: new Date().getDate(),
+          days_remaining: 30 - new Date().getDate(),
+          days_in_month: 30,
+          budget: 100,
+          over_budget: false,
+          over_by: '0.00',
+        },
+        daily_spend: [],
+        output_cost: [],
+        providers: [],
+        active_alerts: [],
+        plan: { name: 'free', calls_used: 0, calls_limit: 10000 },
+        providers_connected: 0,
+        is_sample: false,
+      });
+    }
+
     const [totR, provR, featR, wasteR, projR, dailyR, modelR, outputCostR] = await Promise.all([
-      db(`SELECT COALESCE(SUM(cost_usd),0) as total, COUNT(*) as calls, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'`, [orgId]),
-      db(`SELECT provider, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls, COUNT(*) FILTER (WHERE NOT success) as failed, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY provider ORDER BY cost DESC`, [orgId]),
-      db(`SELECT feature, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY feature ORDER BY cost DESC`, [orgId]),
-      db(`SELECT COUNT(*) as retry_count, COALESCE(SUM(cost_usd),0) as retry_cost FROM spend_events WHERE org_id=$1 AND success=false AND created_at > NOW()-INTERVAL '${interval}'`, [orgId]),
-      db(`SELECT COALESCE(SUM(cost_usd),0)/GREATEST(EXTRACT(DAY FROM NOW()-DATE_TRUNC('month',NOW())),1) as daily_burn FROM spend_events WHERE org_id=$1 AND DATE_TRUNC('month',created_at)=DATE_TRUNC('month',NOW())`, [orgId]),
+      db(`SELECT COALESCE(SUM(cost_usd),0) as total, COUNT(*) as calls, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}'`, [orgId, isSample]),
+      db(`SELECT provider, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls, COUNT(*) FILTER (WHERE NOT success) as failed, COALESCE(SUM(input_tokens+output_tokens),0) as tokens FROM spend_events WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY provider ORDER BY cost DESC`, [orgId, isSample]),
+      db(`SELECT feature, COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls FROM spend_events WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}' GROUP BY feature ORDER BY cost DESC`, [orgId, isSample]),
+      db(`SELECT COUNT(*) as retry_count, COALESCE(SUM(cost_usd),0) as retry_cost FROM spend_events WHERE org_id=$1 AND is_sample=$2 AND success=false AND created_at > NOW()-INTERVAL '${interval}'`, [orgId, isSample]),
+      db(`SELECT COALESCE(SUM(cost_usd),0)/GREATEST(EXTRACT(DAY FROM NOW()-DATE_TRUNC('month',NOW())),1) as daily_burn FROM spend_events WHERE org_id=$1 AND is_sample=$2 AND DATE_TRUNC('month',created_at)=DATE_TRUNC('month',NOW())`, [orgId, isSample]),
       // Daily series for the stacked-provider chart.
       db(`SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS day,
                  provider,
                  COALESCE(SUM(cost_usd),0) AS cost
           FROM spend_events
-          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}'
           GROUP BY day, provider
-          ORDER BY day ASC`, [orgId]),
+          ORDER BY day ASC`, [orgId, isSample]),
       // Per-model rollup for the models table.
       db(`SELECT model,
                  provider,
@@ -606,19 +715,19 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
                  COUNT(*) FILTER (WHERE NOT success) AS failed_calls,
                  ARRAY_AGG(DISTINCT feature) AS features
           FROM spend_events
-          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}'
           GROUP BY model, provider
           ORDER BY cost DESC
-          LIMIT 50`, [orgId]),
+          LIMIT 50`, [orgId, isSample]),
       // Average cost per SUCCESSFUL call, per feature, per day.
       db(`SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS day,
                  feature,
                  COALESCE(SUM(cost_usd),0)
                    / GREATEST(COUNT(*) FILTER (WHERE success), 1) AS avg_cost
           FROM spend_events
-          WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+          WHERE org_id=$1 AND is_sample=$2 AND created_at > NOW()-INTERVAL '${interval}'
           GROUP BY day, feature
-          ORDER BY day ASC`, [orgId]),
+          ORDER BY day ASC`, [orgId, isSample]),
     ]);
 
     const dailyBurn  = parseFloat(projR.rows[0]?.daily_burn || 0);
@@ -763,6 +872,7 @@ app.get('/api/v1/spend/dashboard', apiLimiter, requireAnyAuth, async (req, res) 
       active_alerts,
       plan:           { name: 'free', calls_used: parseInt(totR.rows[0]?.calls||0), calls_limit: 10000 },
       providers_connected: connectedSet.size,
+      is_sample:      isSample,
     });
   } catch (e) {
     console.error('Spend dashboard error:', e.message);
@@ -776,6 +886,9 @@ app.post('/api/v1/spend/keys', apiLimiter, requireAuth, async (req, res) => {
   if (api_key.length < 8) return err(res, 'api_key appears invalid');
 
   try {
+    // Real provider key connected — clear sample data for this org
+    await clearSampleData(db, req.org.id).catch(() => {});
+
     const id  = uuid();
     const enc = encrypt(api_key);
     await db(
@@ -999,13 +1112,62 @@ app.get('/api/v1/export/csv', apiLimiter, requireAnyAuth, async (req, res) => {
     const { rows } = await db(
       `SELECT model, provider, feature, SUM(input_tokens+output_tokens) as tokens, SUM(cost_usd) as cost, COUNT(*) as calls,
               CASE WHEN COUNT(*) FILTER (WHERE NOT success) > 0 THEN 'has_errors' ELSE 'stable' END as status
-       FROM spend_events WHERE org_id=$1 AND created_at > NOW()-INTERVAL '${interval}'
+       FROM spend_events WHERE org_id=$1 AND is_sample = false AND created_at > NOW()-INTERVAL '${interval}'
        GROUP BY model, provider, feature ORDER BY cost DESC`,
       [req.org.id]
     );
     ok(res, { rows: rows.map(r => ({ ...r, cost: parseFloat(r.cost).toFixed(6), tokens: parseInt(r.tokens) })) });
   } catch (e) {
     err(res, 'Export error', 500);
+  }
+});
+
+// ── SAMPLE DATA MANAGEMENT ────────────────────────────────────────
+app.post('/api/v1/sample-data/clear', apiLimiter, requireAnyAuth, async (req, res) => {
+  try {
+    await clearSampleData(db, req.org.id);
+    ok(res, { cleared: true });
+  } catch (e) {
+    err(res, 'Failed to clear sample data', 500);
+  }
+});
+
+app.delete('/api/v1/sample-data', apiLimiter, requireAnyAuth, async (req, res) => {
+  try {
+    await clearSampleData(db, req.org.id);
+    ok(res, { cleared: true });
+  } catch (e) {
+    err(res, 'Failed to clear sample data', 500);
+  }
+});
+
+app.post('/api/v1/sample-data/reload', apiLimiter, requireAnyAuth, async (req, res) => {
+  try {
+    const hasReal = await hasRealData(db, req.org.id);
+    if (hasReal) {
+      return err(res, 'Cannot reload sample data when real tenant data exists', 400);
+    }
+    await clearSampleData(db, req.org.id);
+    await db('UPDATE orgs SET sample_cleared = false WHERE id = $1', [req.org.id]);
+    await seedSampleData(db, req.org.id);
+    ok(res, { reloaded: true });
+  } catch (e) {
+    err(res, 'Failed to reload sample data', 500);
+  }
+});
+
+app.get('/api/v1/sample-data/status', apiLimiter, requireAnyAuth, async (req, res) => {
+  try {
+    const hasReal = await hasRealData(db, req.org.id);
+    const hasSample = await hasSampleData(db, req.org.id);
+    const cleared = await isSampleCleared(db, req.org.id);
+    ok(res, {
+      is_sample: hasSample && !hasReal,
+      has_real_data: hasReal,
+      sample_cleared: cleared,
+    });
+  } catch (e) {
+    err(res, 'Failed to fetch sample data status', 500);
   }
 });
 
