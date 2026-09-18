@@ -92,7 +92,12 @@ export function LoginPage() {
           Sign in →
         </Button>
         <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>
-          No account? <Link to="/signup" style={{ color: 'var(--acid)', textDecoration: 'none' }}>Create one free</Link>
+          {/* SIGNUP DISABLED (owner decision 2026-09-18). The server refuses signup
+              with code SIGNUP_DISABLED unless SIGNUP_ENABLED=true, so the link is
+              hidden rather than leading to a form that cannot succeed. */}
+          {import.meta.env.VITE_SIGNUP_ENABLED === 'true'
+            ? <>No account? <Link to="/signup" style={{ color: 'var(--acid)', textDecoration: 'none' }}>Create one free</Link></>
+            : <span>Account creation is disabled on this instance.</span>}
         </div>
       </form>
     </AuthShell>
