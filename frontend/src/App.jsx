@@ -42,9 +42,16 @@ function ToastContainer() {
 }
 
 // ── PROTECTED ROUTE ───────────────────────────────────────────────
+// AUTH_DISABLED (owner decision 2026-09-18): the login wall is removed while the
+// auth flow is being fixed, so the console opens straight into the app. Set
+// VITE_AUTH_DISABLED=false and rebuild to restore the redirect to /login.
+const AUTH_OPEN = import.meta.env.VITE_AUTH_DISABLED !== 'false'
+
 function Protected({ children }) {
   const { user, loading } = useAuth()
   const location = useLocation()
+
+  if (AUTH_OPEN) return children
 
   if (loading) return (
     <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--base)' }}>
