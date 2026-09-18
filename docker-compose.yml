@@ -42,6 +42,12 @@ services:
       FRONTEND_URL:      ${FRONTEND_URL:-http://localhost:3000}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+      # Auth switches (owner decision 2026-09-18). AUTH_DISABLED=true removes the
+      # login wall; SIGNUP_ENABLED=true re-opens account creation. Both default to
+      # off, so an unset .env keeps the original gated behaviour.
+      AUTH_DISABLED:     ${AUTH_DISABLED:-false}
+      SIGNUP_ENABLED:    ${SIGNUP_ENABLED:-false}
+      AUTH_FALLBACK_ORG_ID: ${AUTH_FALLBACK_ORG_ID:-}
     volumes:
       - backend_data:/data
     ports:
