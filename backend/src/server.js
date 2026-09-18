@@ -442,9 +442,14 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   if (!email || !password) return err(res, 'email and password required');
 
   try {
+    // Normalise EXACTLY as signup does. Signup stores trim+lowercase, so a login
+    // that compares the raw string fails for any user whose keyboard
+    // capitalises the first letter (phones do this by default) or who leaves a
+    // trailing space. A case-insensitive compare keeps the two paths symmetric.
+    const normEmail = String(email).trim().toLowerCase();
     const { rows } = await db(
       `SELECT u.id, u.name, u.email, u.password_hash, u.org_id, o.plan
-       FROM users u JOIN orgs o ON o.id = u.org_id WHERE u.email = $1`, [email]
+       FROM users u JOIN orgs o ON o.id = u.org_id WHERE LOWER(u.email) = $1`, [normEmail]
     );
     if (!rows.length) return err(res, 'Invalid credentials', 401);
 
@@ -452,8 +457,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!valid) return err(res, 'Invalid credentials', 401);
 
     const { id, name, org_id, plan } = rows[0];
-    const token = jwt.sign({ orgId: org_id, userId: id, email, name }, JWT_SECRET, { expiresIn: '30d' });
-    ok(res, { token, user: { id, name, email, plan } });
+    const token = jwt.sign({ orgId: org_id, userId: id, email: normEmail, name }, JWT_SECRET, { expiresIn: '30d' });
+    ok(res, { token, user: { id, name, email: normEmail, plan } });
   } catch (e) {
     err(res, 'Login failed', 500);
   }
