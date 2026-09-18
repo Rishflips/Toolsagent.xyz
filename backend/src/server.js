@@ -338,7 +338,23 @@ const KEY_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 app.get('/health', (_, res) => ok(res, { status: 'ok', version: '1.0.0', ts: new Date().toISOString() }));
 
 // ── AUTH ROUTES ───────────────────────────────────────────────────
+// SIGNUP IS DISABLED (owner decision 2026-09-18).
+// Set SIGNUP_ENABLED=true to re-enable.
+//
+// Why it is off: TA-02 added an "an organization already exists on this instance"
+// confirmation guard, which is wrong for this instance's actual use. ToolsAgent is
+// multi-tenant by org and this deployment is the owner's single workspace, so the
+// guard simply blocked legitimate new signups while naming an unrelated org.
+// The guard itself is not wrong in principle - it needs a per-instance switch,
+// not a hard block. Until then, signup is closed and existing accounts sign in.
 app.post('/api/auth/signup', authLimiter, async (req, res) => {
+  if (process.env.SIGNUP_ENABLED !== 'true') {
+    return res.status(403).json({
+      error: 'Account creation is currently disabled on this instance. '
+           + 'If you already have an account, sign in at /login.',
+      code: 'SIGNUP_DISABLED',
+    });
+  }
   const { name, email, password } = req.body;
   if (!name || !email || !password) return err(res, 'name, email, password required');
   if (password.length < 8) return err(res, 'Password must be at least 8 characters');
