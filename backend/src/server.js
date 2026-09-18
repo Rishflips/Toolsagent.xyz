@@ -254,10 +254,48 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { er
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, message: { error: 'Rate limit exceeded' } });
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────────────
+// OPEN MODE (owner decision 2026-09-18): set AUTH_DISABLED=true to remove the
+// login wall entirely while the auth flow is being fixed. Requests without a
+// token are resolved to one existing organisation so the console is usable
+// immediately. A token, when supplied, still wins - so API keys, the SDK and
+// multi-tenant scoping keep working unchanged.
+//
+// This is a deliberate, reversible switch, NOT a permanent posture:
+//   - it exposes the fallback org's data to anyone who can reach the console
+//   - production traffic currently arrives through a Cloudflare tunnel with no
+//     inbound ports, so exposure is limited, but it is still exposure
+//   - set AUTH_DISABLED back to false (or remove it) to restore the wall
+let CACHED_FALLBACK_ORG = null;
+
+async function resolveFallbackOrg() {
+  if (CACHED_FALLBACK_ORG) return CACHED_FALLBACK_ORG;
+  const explicit = process.env.AUTH_FALLBACK_ORG_ID;
+  const { rows } = explicit
+    ? await db(`SELECT id, plan FROM orgs WHERE id = $1`, [explicit])
+    : await db(`SELECT id, plan FROM orgs ORDER BY created_at ASC LIMIT 1`);
+  if (!rows.length) return null;
+  CACHED_FALLBACK_ORG = { id: rows[0].id, plan: rows[0].plan };
+  return CACHED_FALLBACK_ORG;
+}
+
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Authorization required' });
+
+  // Open mode: no token supplied -> use the fallback org rather than refusing.
+  if (!token) {
+    if (process.env.AUTH_DISABLED === 'true') {
+      try {
+        const org = await resolveFallbackOrg();
+        if (org) {
+          req.org  = { id: org.id, plan: org.plan };
+          req.user = { id: null, email: null, name: 'Open mode' };
+          return next();
+        }
+      } catch (_) { /* fall through to the normal refusal */ }
+    }
+    return res.status(401).json({ error: 'Authorization required' });
+  }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
