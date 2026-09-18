@@ -12,6 +12,7 @@ CREATE TABLE orgs (
   name         TEXT NOT NULL,
   email        TEXT NOT NULL UNIQUE,
   plan         TEXT NOT NULL DEFAULT 'free' CHECK (plan IN ('free','pro','business')),
+  sample_cleared BOOLEAN NOT NULL DEFAULT FALSE,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -55,13 +56,15 @@ CREATE TABLE traces (
   flags         TEXT[] NOT NULL DEFAULT '{}',
   steps         JSONB NOT NULL DEFAULT '[]',
   metadata      JSONB NOT NULL DEFAULT '{}',
-  started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  is_sample     BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX idx_traces_org     ON traces(org_id, started_at DESC);
 CREATE INDEX idx_traces_agent   ON traces(org_id, agent, started_at DESC);
 CREATE INDEX idx_traces_status  ON traces(org_id, status);
 CREATE INDEX idx_traces_flags   ON traces USING GIN(flags);
+CREATE INDEX idx_traces_sample  ON traces(org_id, is_sample);
 
 -- Partition traces by month for performance at scale
 -- (simplified: just index for now, partition when >1M rows)
@@ -74,10 +77,12 @@ CREATE TABLE hallucinations (
   confidence  NUMERIC(4,2) NOT NULL,
   excerpt     TEXT NOT NULL,
   reviewed    BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  is_sample   BOOLEAN NOT NULL DEFAULT FALSE
 );
 
-CREATE INDEX idx_halluc_org ON hallucinations(org_id, created_at DESC);
+CREATE INDEX idx_halluc_org    ON hallucinations(org_id, created_at DESC);
+CREATE INDEX idx_halluc_sample ON hallucinations(org_id, is_sample);
 
 -- ── SPEND MODULE ─────────────────────────────────────────────────
 CREATE TABLE spend_events (
@@ -91,13 +96,15 @@ CREATE TABLE spend_events (
   cost_usd      NUMERIC(12,6) NOT NULL DEFAULT 0,
   success       BOOLEAN NOT NULL DEFAULT TRUE,
   metadata      JSONB NOT NULL DEFAULT '{}',
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  is_sample     BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX idx_spend_org      ON spend_events(org_id, created_at DESC);
 CREATE INDEX idx_spend_provider ON spend_events(org_id, provider, created_at DESC);
 CREATE INDEX idx_spend_feature  ON spend_events(org_id, feature, created_at DESC);
 CREATE INDEX idx_spend_model    ON spend_events(org_id, model, created_at DESC);
+CREATE INDEX idx_spend_sample   ON spend_events(org_id, is_sample);
 
 CREATE TABLE provider_keys (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

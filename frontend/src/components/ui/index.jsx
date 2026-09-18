@@ -204,3 +204,106 @@ export function Panel({ title, subtitle, action, children, className, ...props }
 let _toastCb = null
 export function registerToast(cb) { _toastCb = cb }
 export function toast(msg, type = 'info') { _toastCb?.(msg, type) }
+
+// ── SAMPLE DATA BANNER ───────────────────────────────────────────
+export function SampleBanner({ onClear, loading, moduleName = 'traces' }) {
+  return (
+    <div
+      style={{
+        background: 'rgba(232, 255, 71, 0.05)',
+        border: '1px solid rgba(232, 255, 71, 0.3)',
+        borderLeft: '4px solid var(--acid)',
+        borderRadius: 8,
+        padding: '12px 18px',
+        marginBottom: 20,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 16,
+        flexWrap: 'wrap',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span
+          style={{
+            background: 'var(--acid)',
+            color: '#0A0A0F',
+            fontWeight: 800,
+            fontSize: 10,
+            letterSpacing: '1.2px',
+            textTransform: 'uppercase',
+            padding: '4px 9px',
+            borderRadius: 4,
+            fontFamily: 'var(--font-mono)',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            flexShrink: 0,
+          }}
+        >
+          <span>◈</span> SAMPLE DATA
+        </span>
+        <span style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--font-mono)' }}>
+          You are viewing realistic sample {moduleName} to preview dashboard capabilities. This is not real tenant data.
+        </span>
+      </div>
+      <Button
+        variant="ghost"
+        size="sm"
+        loading={loading}
+        onClick={onClear}
+        style={{ whiteSpace: 'nowrap', borderColor: 'var(--border2)' }}
+      >
+        Clear sample data
+      </Button>
+    </div>
+  )
+}
+
+// ── EMPTY ONBOARDING CARD (TWO CLEAR PATHS) ───────────────────────
+export function EmptyOnboardingCard({
+  title = "No real data recorded yet",
+  description = "Connect a real source to start seeing live metrics, or reload sample data to preview dashboard features.",
+  connectLabel = "+ Connect a real source",
+  onConnect,
+  onReload,
+  reloading
+}) {
+  return (
+    <div
+      style={{
+        background: 'var(--base2)',
+        border: '1px dashed var(--border2)',
+        borderRadius: 10,
+        padding: '18px 22px',
+        marginBottom: 20,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 18,
+        flexWrap: 'wrap',
+      }}
+    >
+      <div>
+        <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 14, color: 'var(--text)', marginBottom: 4 }}>
+          {title}
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text2)', fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
+          {description}
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 10, flexShrink: 0 }}>
+        {onConnect && (
+          <Button variant="outline" size="sm" onClick={onConnect}>
+            {connectLabel}
+          </Button>
+        )}
+        {onReload && (
+          <Button variant="primary" size="sm" loading={reloading} onClick={onReload}>
+            ⟳ Reload sample data
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}

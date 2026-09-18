@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import { useWebSocket, useData } from '../../hooks/useApi'
-import { StatCard, Panel, EmptyState, Button } from '../../components/ui/index'
+import { useWebSocket, useData, apiFetch } from '../../hooks/useApi'
+import { StatCard, Panel, EmptyState, Button, SampleBanner, EmptyOnboardingCard, toast } from '../../components/ui/index'
 import { clsx } from 'clsx'
 import {
   BarChart, Bar, XAxis, YAxis,
@@ -179,18 +179,69 @@ function TraceModal({ trace, onClose }) {
   )
 }
 
+function ConnectTraceModal({ onClose }) {
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: 'var(--base1)', border: '1px solid var(--border2)', borderRadius: 'var(--r-xl)', width: 620, maxHeight: '85vh', overflow: 'auto', boxShadow: 'var(--shadow-lg)', animation: 'fadeUp 0.2s ease' }}>
+        <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 16, marginBottom: 4 }}>Connect a Real Source</div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>Instrument your agents with ToolsAgent to send live traces</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', fontSize: 18, lineHeight: 1, padding: 4 }}>✕</button>
+        </div>
+        <div style={{ padding: '20px 22px' }}>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--acid)', fontFamily: 'var(--font-mono)', marginBottom: 6 }}>1. PYTHON SDK</div>
+            <pre style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text)', overflowX: 'auto', lineHeight: 1.6 }}>
+{`import toolsagent as ta
+
+ta.init(api_key="ts_your_api_key")
+
+with ta.observe.trace(agent="support-agent", task="invoice-query", model="gpt-4o"):
+    # Agent thinking and tool execution
+    response = agent.run("Handle invoice inquiry #1042")`}
+            </pre>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--acid)', fontFamily: 'var(--font-mono)', marginBottom: 6 }}>2. HTTP API / cURL</div>
+            <pre style={{ background: 'var(--base2)', border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text)', overflowX: 'auto', lineHeight: 1.6 }}>
+{`curl -X POST http://localhost:4000/api/v1/observe/traces \\
+  -H "Authorization: Bearer <token>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"agent":"support-agent","task":"invoice-query","model":"gpt-4o","duration_ms":1250,"cost_usd":0.0032}'`}
+            </pre>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+            <span style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)' }}>Manage keys at <a href="/deploy/keys" style={{ color: 'var(--acid)', textDecoration: 'none' }}>/deploy/keys</a></span>
+            <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── OVERVIEW PAGE ────────────────────────────────────────────────
 export default function ObserveOverview({ onEventRate }) {
   const [traces, setTraces]     = useState([])
   const [selected, setSelected] = useState(null)
   const [liveCount, setLiveCount] = useState(0)
+  const [clearing, setClearing]   = useState(false)
+  const [reloading, setReloading] = useState(false)
+  const [showConnect, setShowConnect] = useState(false)
 
   const { data, loading, error, refetch } = useData('/v1/observe/traces?limit=50')
   const { data: dashData, error: dashError, refetch: refetchDash } = useData('/v1/observe/dashboard')
 
   // History from the API. Empty until the fetch lands — never seeded with mocks.
   useEffect(() => {
-    if (!data?.traces) return
+    if (!data?.traces) {
+      setTraces([])
+      return
+    }
     setTraces(data.traces.map(normTrace))
   }, [data])
 
@@ -218,6 +269,33 @@ export default function ObserveOverview({ onEventRate }) {
   const volume = dash.volume || []
   const latency = dash.latency || []
   const hals   = dash.hallucinations || []
+  const isSample = Boolean(dash.is_sample ?? data?.is_sample)
+
+  const handleClear = async () => {
+    setClearing(true)
+    try {
+      await apiFetch('/v1/sample-data/clear', { method: 'POST' })
+      toast('Sample data cleared', 'info')
+      await Promise.all([refetch(), refetchDash()])
+    } catch (e) {
+      toast('Failed to clear sample data: ' + e.message, 'error')
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  const handleReload = async () => {
+    setReloading(true)
+    try {
+      await apiFetch('/v1/sample-data/reload', { method: 'POST' })
+      toast('Sample data loaded', 'success')
+      await Promise.all([refetch(), refetchDash()])
+    } catch (e) {
+      toast('Failed to reload sample data: ' + e.message, 'error')
+    } finally {
+      setReloading(false)
+    }
+  }
 
   // Traces / 6h comes from the dashboard aggregate over the real 6h window —
   // the length of the 50-row page is not that number.
@@ -247,6 +325,27 @@ export default function ObserveOverview({ onEventRate }) {
 
   return (
     <div style={{ padding: 24 }}>
+
+      {/* Sample Data Banner */}
+      {isSample && (
+        <SampleBanner
+          moduleName="traces"
+          loading={clearing}
+          onClear={handleClear}
+        />
+      )}
+
+      {/* Empty State Onboarding: offers two clear paths */}
+      {!isSample && traces.length === 0 && (
+        <EmptyOnboardingCard
+          title="No real traces recorded yet"
+          description="Connect a real agent source to start observing live traces, or reload the sample data to explore dashboard features."
+          connectLabel="+ Send a trace"
+          onConnect={() => setShowConnect(true)}
+          onReload={handleReload}
+          reloading={reloading}
+        />
+      )}
 
       {/* Alert — derived from a real flagged trace, not a hardcoded story */}
       {looped && (
@@ -285,7 +384,14 @@ export default function ObserveOverview({ onEventRate }) {
         <Panel title="⟳ Recent Traces" subtitle="Click any trace to inspect decision chain" action="View all →">
           {traces.length === 0 ? (
             <EmptyState icon="⟳" title="No traces yet"
-              desc="Send your first trace with ta.observe.trace() and it appears here within seconds." />
+              desc="Send your first trace with ta.observe.trace() or reload sample data to preview."
+              action={
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 4 }}>
+                  <Button variant="outline" size="sm" onClick={() => setShowConnect(true)}>+ Send trace</Button>
+                  <Button variant="ghost" size="sm" loading={reloading} onClick={handleReload}>Reload sample data</Button>
+                </div>
+              }
+            />
           ) : (
             <div>{traces.slice(0, 6).map(t => <TraceRow key={t.id} trace={t} onClick={setSelected} />)}</div>
           )}
@@ -409,6 +515,7 @@ export default function ObserveOverview({ onEventRate }) {
       </div>
 
       {selected && <TraceModal trace={selected} onClose={() => setSelected(null)} />}
+      {showConnect && <ConnectTraceModal onClose={() => setShowConnect(false)} />}
     </div>
   )
 }
