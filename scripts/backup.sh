@@ -26,9 +26,18 @@ DEST="$DEST_ROOT/toolsagent-$STAMP"
 
 cd "$REPO_DIR"
 
-if [ ! -f .env ]; then
-  echo "REFUSING TO BACK UP: .env is missing."
-  echo "Without it the database backup is useless — ENCRYPTION_SECRET cannot be regenerated."
+HAS_ENV=0
+[ -f .env ] && HAS_ENV=1
+
+# Check if backend has persisted secrets in container volume
+HAS_CONTAINER_SECRET=0
+if docker compose exec -T backend test -f /data/secret >/dev/null 2>&1; then
+  HAS_CONTAINER_SECRET=1
+fi
+
+if [ "$HAS_ENV" -eq 0 ] && [ "$HAS_CONTAINER_SECRET" -eq 0 ]; then
+  echo "REFUSING TO BACK UP: neither .env nor container secret found."
+  echo "Without secrets the database backup is useless — ENCRYPTION_SECRET cannot be regenerated."
   echo "If this is a fresh checkout, there is nothing to back up yet."
   exit 1
 fi
@@ -47,8 +56,14 @@ if [ ! -s "$DEST/database.sql" ]; then
 fi
 
 echo "==> Copying secrets"
-cp .env "$DEST/env.backup"
-chmod 600 "$DEST/env.backup"
+if [ "$HAS_ENV" -eq 1 ]; then
+  cp .env "$DEST/env.backup"
+  chmod 600 "$DEST/env.backup"
+fi
+if [ "$HAS_CONTAINER_SECRET" -eq 1 ]; then
+  docker compose cp backend:/data/secret "$DEST/secret.backup" 2>/dev/null || true
+  [ -f "$DEST/secret.backup" ] && chmod 600 "$DEST/secret.backup"
+fi
 
 echo "==> Recording what this backup came from"
 {

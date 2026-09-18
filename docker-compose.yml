@@ -36,13 +36,14 @@ services:
       NODE_ENV:          ${NODE_ENV:-production}
       PORT:              4000
       DATABASE_URL:      postgresql://toolsagent:${DB_PASSWORD:-toolsagent_dev}@db:5432/toolsagent
-      # No insecure defaults. See .env.example for how to generate these.
-      # Compose refuses to start until both are set in .env.
-      JWT_SECRET:        ${JWT_SECRET:?JWT_SECRET is required - see .env.example}
-      ENCRYPTION_SECRET: ${ENCRYPTION_SECRET:?ENCRYPTION_SECRET is required - see .env.example}
+      # Secrets are optional in .env; generated and persisted automatically if unset.
+      JWT_SECRET:        ${JWT_SECRET:-}
+      ENCRYPTION_SECRET: ${ENCRYPTION_SECRET:-}
       FRONTEND_URL:      ${FRONTEND_URL:-http://localhost:3000}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+    volumes:
+      - backend_data:/data
     ports:
       - "${BACKEND_PORT:-4000}:4000"
     healthcheck:
@@ -72,6 +73,7 @@ services:
 
 volumes:
   db_data:
+  backend_data:
 
 networks:
   toolsagent:

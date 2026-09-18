@@ -1,5 +1,7 @@
 'use strict';
 
+const fs           = require('fs');
+const path         = require('path');
 const express      = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
@@ -31,15 +33,7 @@ const INSECURE_SECRETS = new Set([
   'secret', 'changeme', 'password',
 ]);
 
-function requireSecret(name, value, { minLength = 32 } = {}) {
-  if (!value) {
-    console.error(
-      `\nFATAL: ${name} is not set.\n` +
-      `Generate one with:\n  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"\n` +
-      `then set ${name} in your .env file.\n`
-    );
-    process.exit(1);
-  }
+function validateSecret(name, value, { minLength = 32 } = {}) {
   if (INSECURE_SECRETS.has(value) || value.length < minLength) {
     console.error(
       `\nFATAL: ${name} is insecure (too short, or a placeholder value from .env.example).\n` +
@@ -51,8 +45,133 @@ function requireSecret(name, value, { minLength = 32 } = {}) {
   return value;
 }
 
-const JWT_SECRET  = requireSecret('JWT_SECRET',  process.env.JWT_SECRET);
-const ENC_SECRET  = requireSecret('ENCRYPTION_SECRET', process.env.ENCRYPTION_SECRET);
+function deriveSecret(masterSecret, purpose) {
+  return crypto.createHmac('sha256', masterSecret).update(purpose).digest('hex');
+}
+
+function getSecretStorageInfo() {
+  if (process.env.SECRET_FILE) {
+    return {
+      secretPath: process.env.SECRET_FILE,
+      markerPath: path.join(path.dirname(process.env.SECRET_FILE), '.secret_source'),
+      isFallback: false,
+    };
+  }
+
+  let dataDir = process.env.DATA_DIR;
+  let isFallback = false;
+  if (!dataDir) {
+    if (fs.existsSync('/data')) {
+      dataDir = '/data';
+    } else {
+      try {
+        fs.mkdirSync('/data', { recursive: true });
+        dataDir = '/data';
+      } catch (_) {
+        dataDir = path.resolve(__dirname, '../data');
+        isFallback = true;
+      }
+    }
+  }
+
+  const secretPath = path.join(dataDir, 'secret');
+  const markerPath = path.join(dataDir, '.secret_source');
+  return { secretPath, markerPath, isFallback };
+}
+
+function recordAndCheckSecretSource(markerPath, currentSource) {
+  try {
+    if (fs.existsSync(markerPath)) {
+      const prevSource = fs.readFileSync(markerPath, 'utf8').trim();
+      if (prevSource && prevSource !== currentSource) {
+        console.warn(
+          `[security] WARNING: Secret source changed from "${prevSource}" to "${currentSource}". ` +
+          `Existing sessions may be invalidated and previously encrypted data may no longer be decryptable.`
+        );
+      }
+    }
+    const targetDir = path.dirname(markerPath);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+    }
+    fs.writeFileSync(markerPath, currentSource + '\n', { mode: 0o600, encoding: 'utf8' });
+    try {
+      fs.chmodSync(markerPath, 0o600);
+    } catch (_) {}
+  } catch (err) {
+    console.error(`[security] Error checking/updating secret source marker: ${err.message}`);
+  }
+}
+
+function getOrGenerateMasterSecret(secretPath, isFallback) {
+  if (isFallback) {
+    console.warn(
+      `[security] WARNING: Using repository fallback path for secret storage at ${secretPath}. ` +
+      `This secret file must never be committed!`
+    );
+  }
+
+  if (fs.existsSync(secretPath)) {
+    try {
+      const persisted = fs.readFileSync(secretPath, 'utf8').trim();
+      if (persisted && persisted.length >= 32 && !INSECURE_SECRETS.has(persisted)) {
+        console.log(`[security] Loaded persisted secret from ${secretPath}`);
+        return persisted;
+      }
+    } catch (err) {
+      console.error(`[security] Error reading persisted secret at ${secretPath}: ${err.message}`);
+    }
+  }
+
+  const generated = crypto.randomBytes(32).toString('hex');
+  const targetDir = path.dirname(secretPath);
+  if (!fs.existsSync(targetDir)) {
+    fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  }
+
+  fs.writeFileSync(secretPath, generated + '\n', { mode: 0o600, encoding: 'utf8' });
+  try {
+    fs.chmodSync(secretPath, 0o600);
+  } catch (_) {}
+
+  console.log(`[security] Generated secret and persisted to ${secretPath}`);
+  return generated;
+}
+
+function resolveSecrets() {
+  const envJwt = process.env.JWT_SECRET;
+  const envEnc = process.env.ENCRYPTION_SECRET;
+  const storage = getSecretStorageInfo();
+
+  const jwtSource = envJwt ? 'env' : 'file';
+  const encSource = envEnc ? 'env' : 'file';
+  const currentSource = `JWT: ${jwtSource}, ENCRYPTION: ${encSource}`;
+
+  recordAndCheckSecretSource(storage.markerPath, currentSource);
+
+  if (envJwt && envEnc) {
+    console.log('[security] Using JWT_SECRET and ENCRYPTION_SECRET from environment');
+    return {
+      jwtSecret: validateSecret('JWT_SECRET', envJwt),
+      encSecret: validateSecret('ENCRYPTION_SECRET', envEnc),
+    };
+  }
+
+  const masterSecret = getOrGenerateMasterSecret(storage.secretPath, storage.isFallback);
+
+  const jwtSecret = envJwt
+    ? validateSecret('JWT_SECRET', envJwt)
+    : deriveSecret(masterSecret, 'jwt_secret');
+
+  const encSecret = envEnc
+    ? validateSecret('ENCRYPTION_SECRET', envEnc)
+    : deriveSecret(masterSecret, 'encryption_secret');
+
+  return { jwtSecret, encSecret };
+}
+
+const { jwtSecret: JWT_SECRET, encSecret: ENC_SECRET } = resolveSecrets();
+
 
 // ── DATABASE ──────────────────────────────────────────────────────
 const pool = new Pool({ connectionString: DB_URL, max: 20 });

@@ -10,6 +10,9 @@ RUN npm ci --omit=dev
 COPY src ./src
 COPY db ./db
 
+# Ensure data directory exists with appropriate permissions for node user
+RUN mkdir -p /data && chown -R node:node /data /app
+
 EXPOSE 4000
 
 # Run as the unprivileged user that the node image already provides.

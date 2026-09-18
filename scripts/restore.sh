@@ -32,29 +32,34 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-for f in database.sql env.backup; do
-  if [ ! -f "$SRC/$f" ]; then
-    echo "ERROR: backup is incomplete — missing $f"
-    echo "A database dump without the matching .env cannot be restored safely:"
-    echo "ENCRYPTION_SECRET derives the key for stored provider credentials."
-    exit 1
-  fi
-done
+if [ ! -f "$SRC/database.sql" ]; then
+  echo "ERROR: backup is incomplete — missing database.sql"
+  exit 1
+fi
+
+if [ ! -f "$SRC/env.backup" ] && [ ! -f "$SRC/secret.backup" ]; then
+  echo "ERROR: backup is incomplete — missing env.backup or secret.backup"
+  echo "A database dump without matching secrets cannot be restored safely:"
+  echo "ENCRYPTION_SECRET derives the key for stored provider credentials."
+  exit 1
+fi
 
 cd "$REPO_DIR"
 
 echo "==> Restoring secrets"
-if [ -f .env ]; then
-  echo "    .env already exists — keeping it and saving the backup copy alongside."
-  echo "    (Overwriting would change JWT_SECRET / ENCRYPTION_SECRET and orphan stored keys.)"
-  cp "$SRC/env.backup" .env.from-backup
-  chmod 600 .env.from-backup
-  echo "    Wrote .env.from-backup — compare the two before continuing:"
-  echo "      diff .env .env.from-backup"
-else
-  cp "$SRC/env.backup" .env
-  chmod 600 .env
-  echo "    .env written."
+if [ -f "$SRC/env.backup" ]; then
+  if [ -f .env ]; then
+    echo "    .env already exists — keeping it and saving the backup copy alongside."
+    echo "    (Overwriting would change JWT_SECRET / ENCRYPTION_SECRET and orphan stored keys.)"
+    cp "$SRC/env.backup" .env.from-backup
+    chmod 600 .env.from-backup
+    echo "    Wrote .env.from-backup — compare the two before continuing:"
+    echo "      diff .env .env.from-backup"
+  else
+    cp "$SRC/env.backup" .env
+    chmod 600 .env
+    echo "    .env written."
+  fi
 fi
 
 echo "==> Starting the database"
