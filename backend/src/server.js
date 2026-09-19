@@ -1033,20 +1033,117 @@ app.post('/api/v1/spend/alerts', apiLimiter, requireAuth, async (req, res) => {
 });
 
 // ── DEPLOY ROUTES ─────────────────────────────────────────────────
+// Display catalogue for the console. A rule is only ever reported as enabled
+// when it is actually present in an agent's `guardrails` JSONB — nothing is
+// assumed on. Enforcement itself does not exist yet (Week 3), so a trigger
+// count of 0 means "nothing recorded", never "nothing configured".
+const GUARDRAIL_CATALOGUE = [
+  { key: 'pii_detection',       name: 'PII Detection',        desc: 'Blocks outputs containing emails, phone numbers or SSN patterns.' },
+  { key: 'loop_breaker',        name: 'Loop Breaker',         desc: 'Stops an agent after 3 consecutive identical tool calls.' },
+  { key: 'cost_limit',          name: 'Cost Circuit Breaker', desc: 'Halts a run whose recorded cost passes the configured limit.' },
+  { key: 'profanity_filter',    name: 'Profanity Filter',     desc: 'Blocks outputs containing profanity or hate speech.' },
+  { key: 'hallucination_check', name: 'Hallucination Flag',   desc: 'Flags outputs citing facts that are not in tool results.' },
+];
+
 app.get('/api/v1/deploy/agents', apiLimiter, requireAnyAuth, async (req, res) => {
   try {
+    const orgId = req.org.id;
     const { rows } = await db(
-      `SELECT a.id, a.name, a.model, a.version, a.status, a.guardrails, a.created_at,
-              COUNT(r.id) FILTER (WHERE r.started_at > NOW()-INTERVAL '1d') as runs_today,
-              ROUND(AVG(r.cost_usd)::numeric, 6) as avg_cost,
-              ROUND(SUM(CASE WHEN r.status='success' THEN 1 ELSE 0 END)*100.0/GREATEST(COUNT(r.id),1)) as success_rate
+      `SELECT a.id, a.name, a.model, a.version, a.status, a.guardrails,
+              a.system_prompt, a.github_url, a.created_at,
+              COUNT(r.id) FILTER (WHERE r.started_at > NOW()-INTERVAL '1d') AS runs_today,
+              COUNT(r.id)                                              AS runs_total,
+              COUNT(r.id) FILTER (WHERE r.status='success')            AS runs_ok,
+              COUNT(r.id) FILTER (WHERE r.status='error')              AS runs_failed,
+              COUNT(r.id) FILTER (WHERE r.status='running')            AS runs_running,
+              COALESCE(SUM(r.cost_usd),0)                              AS total_cost,
+              MAX(r.started_at)                                        AS last_run_at
        FROM agents a LEFT JOIN agent_runs r ON r.agent_id = a.id
        WHERE a.org_id=$1 GROUP BY a.id ORDER BY a.created_at DESC`,
-      [req.org.id]
+      [orgId]
     );
-    ok(res, { agents: rows });
+
+    const agents = rows.map(a => {
+      const total   = Number(a.runs_total);
+      const ok      = Number(a.runs_ok);
+      const running = Number(a.runs_running);
+      const cost    = Number(a.total_cost);
+      return {
+        id:            a.id,
+        name:          a.name,
+        model:         a.model,
+        version:       a.version,
+        // No runner exists, so "running" can only mean a recorded run request
+        // is still open. It is never inferred from the column's default value.
+        status:        running > 0 ? 'running' : 'idle',
+        guardrails:    a.guardrails || {},
+        system_prompt: a.system_prompt,
+        github_url:    a.github_url,
+        created_at:    a.created_at,
+        runs_today:    Number(a.runs_today),
+        runs_total:    total,
+        runs_running:  running,
+        runs_failed:   Number(a.runs_failed),
+        success_rate:  total > 0 ? `${Math.round(ok / total * 100)}%` : '—',
+        avg_cost:      total > 0 ? `$${formatCost(cost / total)}` : '—',
+        total_cost:    `$${formatCost(cost)}`,
+        last_run_at:   a.last_run_at,
+      };
+    });
+
+    const trigR = await db(
+      `SELECT rule, COUNT(*) AS n FROM guardrail_events
+       WHERE org_id=$1 AND triggered AND created_at > NOW()-INTERVAL '1d'
+       GROUP BY rule`, [orgId]
+    );
+    const triggers = new Map(trigR.rows.map(r => [r.rule, Number(r.n)]));
+
+    const guardrails = GUARDRAIL_CATALOGUE.map(g => ({
+      ...g,
+      enabled_agents: agents.filter(a => a.guardrails?.[g.key]).length,
+      triggers:       triggers.get(g.key) || 0,
+    }));
+
+    ok(res, {
+      agents,
+      guardrails,
+      // The console renders this verbatim so the capability claim lives in one
+      // place (the server) instead of being re-asserted by the UI.
+      execution_implemented: false,
+      execution_notice: 'Agent execution is not implemented yet — the Run button records a request only.',
+    });
   } catch (e) {
     err(res, 'Failed to fetch agents', 500);
+  }
+});
+
+// Fleet-wide run history. The per-agent route below answers "what did THIS agent
+// do"; the console's run panel needs all of them plus the day's totals.
+app.get('/api/v1/deploy/runs', apiLimiter, requireAnyAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 25, 100);
+  try {
+    const orgId = req.org.id;
+    const { rows } = await db(
+      `SELECT r.id, r.task, r.status, r.blocks, r.duration_ms, r.cost_usd,
+              r.started_at, r.finished_at, a.name AS agent
+       FROM agent_runs r JOIN agents a ON a.id = r.agent_id
+       WHERE r.org_id=$1 ORDER BY r.started_at DESC LIMIT $2`,
+      [orgId, limit]
+    );
+    ok(res, {
+      runs: rows.map(r => ({
+        id:         r.id,
+        agent:      r.agent,
+        task:       r.task,
+        status:     r.status,
+        blocks:     Number(r.blocks),
+        duration:   r.duration_ms === null ? '—' : formatDuration(r.duration_ms),
+        cost:       `$${formatCost(parseFloat(r.cost_usd || 0))}`,
+        started_at: r.started_at,
+      })),
+    });
+  } catch (e) {
+    err(res, 'Failed to fetch runs', 500);
   }
 });
 
@@ -1089,7 +1186,13 @@ app.post('/api/v1/deploy/agents/:agentId/run', apiLimiter, requireAnyAuth, async
     // Broadcast run start via WebSocket
     broadcastToOrg(req.org.id, { type: 'run_started', data: { run_id: runId, agent: rows[0].name, task } });
 
-    ok(res, { run: { id: runId, agent_id: agentId, task, status: 'running' } }, 202);
+    // Honest contract: nothing executes yet. This records a request that no
+    // runner will pick up, so success here must never be read as "the agent ran".
+    ok(res, {
+      run: { id: runId, agent_id: agentId, task, status: 'running' },
+      execution_implemented: false,
+      notice: 'Agent execution is not implemented yet — this records a run request only.',
+    }, 202);
   } catch (e) {
     err(res, 'Failed to start run', 500);
   }
